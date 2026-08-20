@@ -328,6 +328,10 @@ jobs:
         if: ${{ github.event.inputs.enable_hid == 'true' }}
         run: |
           cd kernel_workspace/common/arch/arm64/configs
+          # Note: F_UAC1 and F_UAC1_LEGACY are two separate audio-source
+          # function drivers (new vs legacy ALSA path). Some GKI Kconfig
+          # versions treat them as a mutually exclusive choice — if the
+          # build fails on this pair, drop F_UAC1_LEGACY and keep F_UAC1.
           {
             echo "CONFIG_USB_GADGET=y"
             echo "CONFIG_USB_LIBCOMPOSITE=y"
@@ -344,6 +348,10 @@ jobs:
             echo "CONFIG_USB_CONFIGFS_F_HID=y"
             echo "CONFIG_USB_CONFIGFS_F_FS=y"
             echo "CONFIG_USB_CONFIGFS_UEVENT=y"
+            echo "CONFIG_USB_CONFIGFS_F_LB_SS=y"
+            echo "CONFIG_USB_CONFIGFS_F_PRINTER=y"
+            echo "CONFIG_USB_CONFIGFS_F_UAC1=y"
+            echo "CONFIG_USB_CONFIGFS_F_UAC1_LEGACY=y"
             echo "CONFIG_USB_ACM=y"
             echo "CONFIG_HIDRAW=y"
             echo "CONFIG_UHID=y"
@@ -447,6 +455,11 @@ jobs:
           for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET; do
             grep -q "^${SYM}=y$" "$CFG"
           done
+          if [ "${{ github.event.inputs.enable_hid }}" = "true" ]; then
+            for SYM in CONFIG_USB_CONFIGFS_F_LB_SS CONFIG_USB_CONFIGFS_F_PRINTER CONFIG_USB_CONFIGFS_F_UAC1; do
+              grep -q "^${SYM}=y$" "$CFG" || echo "::warning::${SYM} did not end up enabled in the final .config"
+            done
+          fi
           if [ "${{ github.event.inputs.enable_can }}" = "true" ]; then
             grep -q "^CONFIG_CAN=y$" "$CFG"
           fi
