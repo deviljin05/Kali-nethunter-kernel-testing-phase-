@@ -389,6 +389,59 @@ jobs:
             echo "CONFIG_CAN_UCAN=y"
           } >> gki_defconfig
 
+      - name: Set Kali/NetHunter toolset kernel configs
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            # --- Netfilter / iptables / nftables (MITM, NAT, hotspot, arpspoof) ---
+            echo "CONFIG_NETFILTER=y"
+            echo "CONFIG_NETFILTER_ADVANCED=y"
+            echo "CONFIG_NF_CONNTRACK=y"
+            echo "CONFIG_NF_CONNTRACK_EVENTS=y"
+            echo "CONFIG_NF_NAT=y"
+            echo "CONFIG_NF_NAT_MASQUERADE=y"
+            echo "CONFIG_NETFILTER_XTABLES=y"
+            echo "CONFIG_IP_NF_IPTABLES=y"
+            echo "CONFIG_IP_NF_NAT=y"
+            echo "CONFIG_IP_NF_TARGET_MASQUERADE=y"
+            echo "CONFIG_IP_NF_TARGET_REJECT=y"
+            echo "CONFIG_IP_NF_FILTER=y"
+            echo "CONFIG_IP_NF_MANGLE=y"
+            echo "CONFIG_IP6_NF_IPTABLES=y"
+            echo "CONFIG_IP6_NF_NAT=y"
+            echo "CONFIG_IP6_NF_FILTER=y"
+            echo "CONFIG_NF_TABLES=y"
+            echo "CONFIG_NF_TABLES_INET=y"
+            echo "CONFIG_NFT_NAT=y"
+            echo "CONFIG_NFT_MASQ=y"
+            echo "CONFIG_NFT_CT=y"
+
+            # --- Bridge / VLAN (AP mode, transparent MITM) ---
+            echo "CONFIG_BRIDGE=y"
+            echo "CONFIG_BRIDGE_NETFILTER=y"
+            echo "CONFIG_VLAN_8021Q=y"
+
+            # --- TUN/TAP (OpenVPN, WireGuard client tools) ---
+            echo "CONFIG_TUN=y"
+
+            # --- USB serial adapters (RTL-SDR, Arduino, FTDI-based tools) ---
+            echo "CONFIG_USB_SERIAL=y"
+            echo "CONFIG_USB_SERIAL_FTDI_SIO=y"
+            echo "CONFIG_USB_SERIAL_CP210X=y"
+            echo "CONFIG_USB_SERIAL_PL2303=y"
+            echo "CONFIG_USB_SERIAL_CH341=y"
+
+            # --- Overlay filesystem (chroot/proot rootfs managers rely on this) ---
+            echo "CONFIG_OVERLAY_FS=y"
+
+            # --- Bluetooth / BLE tooling ---
+            echo "CONFIG_BT=y"
+            echo "CONFIG_BT_HCIUART=y"
+
+            # --- Legacy wireless extensions (some older wifi tools expect this) ---
+            echo "CONFIG_CFG80211_WEXT=y"
+          } >> gki_defconfig
+
       - name: Set IIO / PCI endpoint configfs configs
         run: |
           cd kernel_workspace/common/arch/arm64/configs
@@ -460,6 +513,9 @@ jobs:
               grep -q "^${SYM}=y$" "$CFG" || echo "::warning::${SYM} did not end up enabled in the final .config"
             done
           fi
+          for SYM in CONFIG_NETFILTER CONFIG_NF_NAT CONFIG_IP_NF_IPTABLES CONFIG_NF_TABLES CONFIG_BRIDGE CONFIG_TUN CONFIG_USB_SERIAL CONFIG_OVERLAY_FS CONFIG_BT; do
+            grep -q "^${SYM}=y$" "$CFG" || echo "::warning::${SYM} did not end up enabled in the final .config"
+          done
           if [ "${{ github.event.inputs.enable_can }}" = "true" ]; then
             grep -q "^CONFIG_CAN=y$" "$CFG"
           fi
