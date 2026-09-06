@@ -1,4 +1,4 @@
-name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3 + Full HID Support)
+name: Build Custom GKI Kernel (SukiSU-Ultra + SUSFS + BBRv3 + Full HID Support)
 
 on:
   workflow_dispatch:
@@ -11,6 +11,10 @@ on:
         description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch)"
         required: false
         default: ""
+      sukisu_ref:
+        description: "SukiSU-Ultra ref to check out (branch/tag/commit). Leave as 'builtin' for the branch with SUSFS baked into the KSU side."
+        required: true
+        default: "builtin"
       device_name:
         description: "Optional label for artifact naming"
         required: false
@@ -192,19 +196,26 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      - name: Setup KernelSU-Next
+      # SukiSU-Ultra replaces KernelSU-Next here. We use the "builtin" ref by
+      # default: per SukiSU-Ultra's own docs, "main" is the v4 modular tree
+      # (module-based, KPM-focused) and does NOT carry SUSFS support on the
+      # KSU side, while "builtin" is the source-embedded tree that already
+      # bundles the KSU-side SUSFS hooks. Passing a non-existent ref (like
+      # the old "susfs-main" convention some outdated guides mention) does
+      # NOT fail the build — setup.sh silently falls back to its default
+      # branch — so this step pins an explicit, verified ref instead.
+      - name: Setup SukiSU-Ultra
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          curl -fsSL "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
+          curl -fsSL "https://raw.githubusercontent.com/sukisu-ultra/sukisu-ultra/main/kernel/setup.sh" | bash -s "${{ github.event.inputs.sukisu_ref }}"
+          echo "SUKISU_COMMIT=$(git -C KernelSU rev-parse HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
 
-      - name: Fix KernelSU-Next static patch
-        working-directory: kernel_workspace/common/KernelSU-Next
-        run: |
-          set -euo pipefail
-          curl -fsSL -o static.patch \
-            https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/kernelsu/patches/static.patch
-          patch -p1 --forward < static.patch || true
+      # NOTE: the old "Fix KernelSU-Next static patch" step is intentionally
+      # removed. That patch (from WildKernels/GKI_KernelSU_SUSFS) targeted a
+      # static-assertion bug specific to the pershoot/KernelSU-Next fork and
+      # its KernelSU-Next/ directory layout — it doesn't apply to SukiSU-Ultra
+      # and there's nothing to replace it with unless a build error surfaces.
 
       - name: Install Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -412,7 +423,7 @@ jobs:
           chmod +x scripts/setlocalversion.orig
           cat > scripts/setlocalversion << 'EOF'
           #!/bin/sh
-          printf -- '-BLAZE-KSUNv1-STABLE'
+          printf -- '-BLAZE-SukiSU-STABLE'
 
           EOF
           chmod +x scripts/setlocalversion
@@ -452,7 +463,7 @@ jobs:
           set -euo pipefail
           CFG=$(find out -name ".config" | head -n1)
           [ -n "$CFG" ]
-          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET; do
+          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET CONFIG_KSU CONFIG_KSU_SUSFS; do
             grep -q "^${SYM}=y$" "$CFG"
           done
           if [ "${{ github.event.inputs.enable_hid }}" = "true" ]; then
