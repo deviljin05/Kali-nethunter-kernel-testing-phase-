@@ -12,9 +12,9 @@ on:
         required: false
         default: ""
       ksu_ref:
-        description: "tiann/KernelSU branch/tag/commit to check out (e.g. main, or a pinned release tag like v0.9.5). SUSFS was originally built against this repo, so no fork/branch juggling is needed here — just the version you want."
+        description: "KOWX712/KernelSU branch/tag/commit to check out (e.g. master, or a pinned release tag)"
         required: true
-        default: "main"
+        default: "master"
       device_name:
         description: "Optional label for artifact naming"
         required: false
@@ -196,32 +196,37 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      # Original KernelSU (tiann/KernelSU) replaces KernelSU-Next here.
-      # This is the upstream repo susfs4ksu is written against, so unlike
-      # KernelSU-Next there's no third-party fork/branch to track for SUSFS
-      # support -- the official setup.sh + main tree is enough.
-      # Ref: https://kernelsu.org/guide/how-to-build.html
+      # Switched from tiann/KernelSU to KOWX712/KernelSU (personal fork of
+      # backslashxx/KernelSU, itself forked from tiann/KernelSU -- so the
+      # kernel/ driver tree and setup.sh contract are unchanged, just the
+      # clone source and default branch differ: KOWX712 uses "master" not
+      # "main"). setup.sh syntax/behavior is identical across the family.
       - name: Setup KernelSU
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          curl -fsSL "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "${{ github.event.inputs.ksu_ref }}"
+          curl -fsSL "https://raw.githubusercontent.com/KOWX712/KernelSU/master/kernel/setup.sh" | bash -s "${{ github.event.inputs.ksu_ref }}"
           echo "KSU_COMMIT=$(git -C KernelSU rev-parse HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
 
-      # Unlike KernelSU-Next/SukiSU-Ultra (which ship SUSFS support already
-      # merged into the driver), plain tiann/KernelSU does NOT define
-      # CONFIG_KSU_SUSFS or any susfs hooks in its own Kconfig/source. susfs4ksu
-      # ships a separate patch specifically for this -- kernel_patches/KernelSU/
-      # 10_enable_susfs_for_ksu.patch -- which must be applied *inside the
-      # KernelSU/ driver directory itself* (not common/). Skipping this is why
-      # "Verify final configs" was failing on CONFIG_KSU_SUSFS: the symbol
-      # didn't exist yet, so it silently dropped out of the merged .config.
+      # backslashxx/KernelSU (KOWX712's parent) is a GKI/SUSFS-focused fork,
+      # so it may already carry CONFIG_KSU_SUSFS/susfs hooks in its driver
+      # tree, unlike plain tiann/KernelSU which needs this patch applied
+      # separately. Made fail-soft: try the patch, but don't hard-fail the
+      # build if it's already integrated or the file layout has since
+      # diverged -- just warn and continue, then "Verify final configs"
+      # will still catch it for real if CONFIG_KSU_SUSFS never gets set.
       - name: Apply SUSFS patch to the KernelSU driver
         working-directory: kernel_workspace/common/KernelSU
         run: |
           set -euo pipefail
           cp ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./
-          patch -p1 --fuzz=3 < 10_enable_susfs_for_ksu.patch
+          if grep -rq "CONFIG_KSU_SUSFS" . 2>/dev/null; then
+            echo "::notice::SUSFS hooks already present in KOWX712/KernelSU driver tree, skipping patch."
+          elif patch -p1 --fuzz=3 --dry-run < 10_enable_susfs_for_ksu.patch >/dev/null 2>&1; then
+            patch -p1 --fuzz=3 < 10_enable_susfs_for_ksu.patch
+          else
+            echo "::warning::10_enable_susfs_for_ksu.patch did not apply cleanly against KOWX712/KernelSU -- continuing, but check CONFIG_KSU_SUSFS in 'Verify final configs' below."
+          fi
 
       - name: Install Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -442,17 +447,7 @@ jobs:
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          # We've added new =m modules that aren't in the upstream
-          # android/gki_aarch64_modules allow-list. The GKI build compares the
-          # generated modules.order against the file pointed to by MODULES_ORDER
-          # (usually android/gki_aarch64_modules) and fails with "modules list
-          # out of date" on any mismatch. Blank MODULES_ORDER in every
-          # build.config* so build.sh skips that diff check entirely. This only
-          # disables the build-time bookkeeping comparison — it does not change
-          # which modules get compiled, built into the Image, or loaded at runtime,
-          # so it carries no bootloop risk on its own.
           grep -rl '^MODULES_ORDER=' build.config* 2>/dev/null | xargs -r sed -i 's/^MODULES_ORDER=.*/MODULES_ORDER=/' || true
-          # Also cover MODULES_LIST in case a downstream config uses that name instead.
           grep -rl '^MODULES_LIST=' build.config* 2>/dev/null | xargs -r sed -i 's/^MODULES_LIST=.*/MODULES_LIST=/' || true
 
       - name: Build kernel
