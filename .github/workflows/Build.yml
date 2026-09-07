@@ -208,6 +208,21 @@ jobs:
           curl -fsSL "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "${{ github.event.inputs.ksu_ref }}"
           echo "KSU_COMMIT=$(git -C KernelSU rev-parse HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
 
+      # Unlike KernelSU-Next/SukiSU-Ultra (which ship SUSFS support already
+      # merged into the driver), plain tiann/KernelSU does NOT define
+      # CONFIG_KSU_SUSFS or any susfs hooks in its own Kconfig/source. susfs4ksu
+      # ships a separate patch specifically for this -- kernel_patches/KernelSU/
+      # 10_enable_susfs_for_ksu.patch -- which must be applied *inside the
+      # KernelSU/ driver directory itself* (not common/). Skipping this is why
+      # "Verify final configs" was failing on CONFIG_KSU_SUSFS: the symbol
+      # didn't exist yet, so it silently dropped out of the merged .config.
+      - name: Apply SUSFS patch to the KernelSU driver
+        working-directory: kernel_workspace/common/KernelSU
+        run: |
+          set -euo pipefail
+          cp ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./
+          patch -p1 --fuzz=3 < 10_enable_susfs_for_ksu.patch
+
       - name: Install Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         working-directory: kernel_workspace
