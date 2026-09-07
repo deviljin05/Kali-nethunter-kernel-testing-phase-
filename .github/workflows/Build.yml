@@ -1,4 +1,4 @@
-name: Build Custom GKI Kernel (SukiSU-Ultra + SUSFS + BBRv3 + Full HID Support)
+name: Build Custom GKI Kernel (KernelSU + SUSFS + BBRv3 + Full HID Support)
 
 on:
   workflow_dispatch:
@@ -11,10 +11,10 @@ on:
         description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch)"
         required: false
         default: ""
-      sukisu_ref:
-        description: "SukiSU-Ultra ref to check out (branch/tag/commit). 'builtin' = always-latest dev branch with SUSFS baked in (can break mid-refactor). Pin an exact commit hash here for a reproducible/stable build."
+      ksu_ref:
+        description: "tiann/KernelSU branch/tag/commit to check out (e.g. main, or a pinned release tag like v0.9.5). SUSFS was originally built against this repo, so no fork/branch juggling is needed here — just the version you want."
         required: true
-        default: "builtin"
+        default: "main"
       device_name:
         description: "Optional label for artifact naming"
         required: false
@@ -196,50 +196,17 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      # SukiSU-Ultra replaces KernelSU-Next here. We use the "builtin" ref by
-      # default: per SukiSU-Ultra's own docs, "main" is the v4 modular tree
-      # (module-based, KPM-focused) and does NOT carry SUSFS support on the
-      # KSU side, while "builtin" is the source-embedded tree that already
-      # bundles the KSU-side SUSFS hooks. Passing a non-existent ref (like
-      # the old "susfs-main" convention some outdated guides mention) does
-      # NOT fail the build — setup.sh silently falls back to its default
-      # branch — so this step pins an explicit, verified ref instead.
-      - name: Setup SukiSU-Ultra
+      # Original KernelSU (tiann/KernelSU) replaces KernelSU-Next here.
+      # This is the upstream repo susfs4ksu is written against, so unlike
+      # KernelSU-Next there's no third-party fork/branch to track for SUSFS
+      # support -- the official setup.sh + main tree is enough.
+      # Ref: https://kernelsu.org/guide/how-to-build.html
+      - name: Setup KernelSU
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          curl -fsSL "https://raw.githubusercontent.com/sukisu-ultra/sukisu-ultra/main/kernel/setup.sh" | bash -s "${{ github.event.inputs.sukisu_ref }}"
-          echo "SUKISU_COMMIT=$(git -C KernelSU rev-parse HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
-
-      # Best-effort auto-heal for known SukiSU-Ultra "builtin" churn.
-      # The builtin branch is an actively-refactored dev branch (feature/ksud
-      # rework in progress), so it occasionally lands commits where a
-      # feature struct registers a .set_handler that was never actually
-      # written (only the _get counterpart exists) — e.g. kernel_umount.c
-      # referencing an undefined kernel_umount_feature_set. When that
-      # specific pattern shows up, fall back to a NULL (read-only) setter so
-      # the build isn't blocked by upstream's in-progress work. This is a
-      # narrow, idempotent check: if upstream later ships the real function,
-      # HAS_DEF becomes >0 and this step does nothing.
-      - name: Auto-heal known SukiSU-Ultra builtin build breaks
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          FILE="drivers/kernelsu/feature/kernel_umount.c"
-          if [ -f "$FILE" ]; then
-            HAS_DEF=$(grep -cE 'kernel_umount_feature_set[[:space:]]*\(' "$FILE" || true)
-            REGISTERED=$(grep -c '\.set_handler[[:space:]]*=[[:space:]]*kernel_umount_feature_set' "$FILE" || true)
-            if [ "${REGISTERED:-0}" -ge 1 ] && [ "${HAS_DEF:-0}" -le "${REGISTERED:-0}" ]; then
-              echo "::warning::kernel_umount_feature_set is registered but not defined (known SukiSU-Ultra builtin WIP) — falling back to a read-only handler"
-              sed -i 's/\.set_handler[[:space:]]*=[[:space:]]*kernel_umount_feature_set,/.set_handler = NULL,/' "$FILE"
-            fi
-          fi
-
-      # NOTE: the old "Fix KernelSU-Next static patch" step is intentionally
-      # removed. That patch (from WildKernels/GKI_KernelSU_SUSFS) targeted a
-      # static-assertion bug specific to the pershoot/KernelSU-Next fork and
-      # its KernelSU-Next/ directory layout — it doesn't apply to SukiSU-Ultra
-      # and there's nothing to replace it with unless a build error surfaces.
+          curl -fsSL "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "${{ github.event.inputs.ksu_ref }}"
+          echo "KSU_COMMIT=$(git -C KernelSU rev-parse HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
 
       - name: Install Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -447,7 +414,7 @@ jobs:
           chmod +x scripts/setlocalversion.orig
           cat > scripts/setlocalversion << 'EOF'
           #!/bin/sh
-          printf -- '-BLAZE-SukiSU-STABLE'
+          printf -- '-BLAZE-KernelSU-STABLE'
 
           EOF
           chmod +x scripts/setlocalversion
@@ -516,7 +483,7 @@ jobs:
           git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 ak3
           cp "${{ env.IMG_PATH }}" ak3/Image
           cd ak3
-          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
+          zip -r9 -q "../${{ github.event.inputs.device_name }}-KernelSU-android12-5.10-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
