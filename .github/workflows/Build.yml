@@ -196,11 +196,6 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      # Switched from tiann/KernelSU to KOWX712/KernelSU (personal fork of
-      # backslashxx/KernelSU, itself forked from tiann/KernelSU -- so the
-      # kernel/ driver tree and setup.sh contract are unchanged, just the
-      # clone source and default branch differ: KOWX712 uses "master" not
-      # "main"). setup.sh syntax/behavior is identical across the family.
       - name: Setup KernelSU
         working-directory: kernel_workspace/common
         run: |
@@ -208,13 +203,6 @@ jobs:
           curl -fsSL "https://raw.githubusercontent.com/KOWX712/KernelSU/master/kernel/setup.sh" | bash -s "${{ github.event.inputs.ksu_ref }}"
           echo "KSU_COMMIT=$(git -C KernelSU rev-parse HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
 
-      # backslashxx/KernelSU (KOWX712's parent) is a GKI/SUSFS-focused fork,
-      # so it may already carry CONFIG_KSU_SUSFS/susfs hooks in its driver
-      # tree, unlike plain tiann/KernelSU which needs this patch applied
-      # separately. Made fail-soft: try the patch, but don't hard-fail the
-      # build if it's already integrated or the file layout has since
-      # diverged -- just warn and continue, then "Verify final configs"
-      # will still catch it for real if CONFIG_KSU_SUSFS never gets set.
       - name: Apply SUSFS patch to the KernelSU driver
         working-directory: kernel_workspace/common/KernelSU
         run: |
@@ -350,10 +338,6 @@ jobs:
         if: ${{ github.event.inputs.enable_hid == 'true' }}
         run: |
           cd kernel_workspace/common/arch/arm64/configs
-          # Note: F_UAC1 and F_UAC1_LEGACY are two separate audio-source
-          # function drivers (new vs legacy ALSA path). Some GKI Kconfig
-          # versions treat them as a mutually exclusive choice — if the
-          # build fails on this pair, drop F_UAC1_LEGACY and keep F_UAC1.
           {
             echo "CONFIG_USB_GADGET=y"
             echo "CONFIG_USB_LIBCOMPOSITE=y"
@@ -384,23 +368,17 @@ jobs:
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
-            # Core CAN subsystem + network layer protocols
             echo "CONFIG_CAN=y"
             echo "CONFIG_CAN_RAW=y"
             echo "CONFIG_CAN_BCM=y"
             echo "CONFIG_CAN_GW=y"
             echo "CONFIG_CAN_J1939=y"
             echo "CONFIG_CAN_ISOTP=y"
-            # Virtual + serial-line CAN so CARsenal/candump work even without
-            # a physical adapter attached (vcan0, slcan)
             echo "CONFIG_CAN_VCAN=y"
             echo "CONFIG_CAN_VXCAN=y"
             echo "CONFIG_CAN_SLCAN=y"
             echo "CONFIG_CAN_DEV=y"
             echo "CONFIG_CAN_CALC_BITTIMING=y"
-            # Common USB-CAN adapter drivers (Kvaser Leaf, PEAK PCAN-USB,
-            # EMS CPC-USB, 8devices USB2CAN, Geschwister Schneider/candleLight,
-            # Microchip usb251xb-style CAN, ESD USB/2)
             echo "CONFIG_CAN_KVASER_USB=y"
             echo "CONFIG_CAN_PEAK_USB=y"
             echo "CONFIG_CAN_EMS_USB=y"
@@ -415,13 +393,8 @@ jobs:
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
-            # IIO_CONFIGFS needs the IIO core enabled first
             echo "CONFIG_IIO=y"
             echo "CONFIG_IIO_CONFIGFS=y"
-            # PCI_ENDPOINT_CONFIGFS needs a PCI endpoint controller framework;
-            # most phone SoCs don't expose one, so this may stay "Not set"
-            # even after this even if requested — that's a hardware/config
-            # dependency limit, not a mistake in this step.
             echo "CONFIG_PCI_ENDPOINT=y"
             echo "CONFIG_PCI_ENDPOINT_CONFIGFS=y"
           } >> gki_defconfig
@@ -462,18 +435,51 @@ jobs:
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          CFG=$(find out -name ".config" | head -n1)
-          [ -n "$CFG" ]
-          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET CONFIG_KSU CONFIG_KSU_SUSFS; do
-            grep -q "^${SYM}=y$" "$CFG"
+          # Pick the largest .config found (avoids grabbing a stray/host .config
+          # that some build steps or toolchains drop elsewhere under out/).
+          CFG=""
+          BEST_SIZE=0
+          while IFS= read -r -d '' f; do
+            SZ=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            if [ "$SZ" -gt "$BEST_SIZE" ]; then
+              BEST_SIZE="$SZ"
+              CFG="$f"
+            fi
+          done < <(find out -name ".config" -print0)
+          if [ -z "$CFG" ]; then
+            echo "::error::No .config file found anywhere under out/ -- build likely failed before config generation."
+            exit 1
+          fi
+          echo "Using config file: $CFG"
+
+          FAIL=0
+          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_GADGET CONFIG_USB_CONFIGFS CONFIG_KSU; do
+            if ! grep -q "^${SYM}=y$" "$CFG"; then
+              echo "::error::${SYM} is NOT enabled in the final .config (required)."
+              FAIL=1
+            fi
           done
+
+          for SYM in CONFIG_KSU_SUSFS CONFIG_USB_CONFIGFS_F_HID; do
+            if ! grep -q "^${SYM}=y$" "$CFG"; then
+              echo "::warning::${SYM} did not end up enabled in the final .config (patch may not have applied cleanly -- check earlier steps)."
+            fi
+          done
+
           if [ "${{ github.event.inputs.enable_hid }}" = "true" ]; then
             for SYM in CONFIG_USB_CONFIGFS_F_LB_SS CONFIG_USB_CONFIGFS_F_PRINTER CONFIG_USB_CONFIGFS_F_UAC1; do
               grep -q "^${SYM}=y$" "$CFG" || echo "::warning::${SYM} did not end up enabled in the final .config"
             done
           fi
+
           if [ "${{ github.event.inputs.enable_can }}" = "true" ]; then
-            grep -q "^CONFIG_CAN=y$" "$CFG"
+            grep -q "^CONFIG_CAN=y$" "$CFG" || echo "::warning::CONFIG_CAN did not end up enabled in the final .config (check CAN Kconfig dependencies for this GKI tree)"
+          fi
+
+          if [ "$FAIL" -eq 1 ]; then
+            echo "----- Dumping full .config for debugging -----"
+            grep -E "CONFIG_(KSU|CAN|USB_CONFIGFS|NAMESPACES|NET_NS|PID_NS|CGROUPS|USER_NS)" "$CFG" || true
+            exit 1
           fi
 
       - name: Locate built Image
