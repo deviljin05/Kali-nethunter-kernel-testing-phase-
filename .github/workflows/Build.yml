@@ -35,8 +35,8 @@ env:
   KSU_NEXT_BRANCH: "dev-susfs"
   SUSFS_REPO: "https://gitlab.com/simonpunk/susfs4ksu.git"
   SUSFS_BRANCH: "gki-android12-5.10"
-  # PINNED COMMIT — verified from WildKernels Release r5, complete header files
-  SUSFS_PINNED_COMMIT: "86114db0c49f20fa7857b8b559f3ab87cbc2d00d"
+  # PINNED COMMIT — verified from WildKernels Release r20 (v1.5.9-r20)
+  SUSFS_PINNED_COMMIT: "6f42c0e24e35a6fa0fc43051a5f1e7dfe568e8c2"
 
 jobs:
   build:
@@ -55,7 +55,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git curl bc bison flex libssl-dev \
             build-essential python3 python3-pip libncurses-dev \
-            ccache zip unzip device-tree-compiler patch
+            ccache zip unzip device-tree-compiler patch binutils
 
       - name: Install repo tool
         run: |
@@ -171,6 +171,8 @@ jobs:
       - name: Copy SUSFS kernel patches
         run: |
           cd kernel_workspace/common
+          # Remove any stale headers from the kernel source before copying
+          rm -f include/linux/susfs.h include/linux/susfs_def.h
           cp ../susfs4ksu/kernel_patches/fs/* ./fs/
           cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
           cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./
@@ -223,6 +225,18 @@ jobs:
               sed -i "1i #include <linux/susfs.h>" fs/statfs.c
               echo "Added susfs.h to fs/statfs.c"
             fi
+          fi
+
+      - name: Inject missing SUSFS constants into susfs.h
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          # Ensure the constants are defined before any use, bypassing the include-order bug
+          if ! grep -q 'SUSFS_MAX_LEN_PATHNAME' include/linux/susfs.h; then
+            sed -i '1i #define SUSFS_MAX_LEN_PATHNAME 256\n#define SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE 8192\n#define SUSFS_ENABLED_FEATURES_SIZE 8192' include/linux/susfs.h
+            echo "Injected missing SUSFS constants into susfs.h"
+          else
+            echo "SUSFS constants already present in susfs.h"
           fi
 
       - name: Fix set_nameidata argument mismatch
