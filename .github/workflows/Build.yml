@@ -194,13 +194,6 @@ jobs:
           set -euo pipefail
           curl -fsSL "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
 
-      - name: Fix KernelSU-Next static patch
-        working-directory: kernel_workspace/common/KernelSU-Next
-        run: |
-          set -euo pipefail
-          curl -fsSL -o static.patch \
-            https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/kernelsu/patches/static.patch
-          patch -p1 --forward < static.patch || true
 
       - name: Install Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
