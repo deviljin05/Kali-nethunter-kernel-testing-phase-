@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       os_patch_level:
-        description: "'lts' or exact GKI tag (e.g. android12-5.10.264_r00)"
+        description: "'lts' or exact GKI tag"
         required: true
         default: "android12-5.10.264_r00"
       susfs_commit:
-        description: "SUSFS commit (empty = auto latest)"
+        description: "SUSFS commit (empty = try auto latest, fallback to pinned if broken)"
         required: false
         default: ""
       ksu_commit:
@@ -39,6 +39,7 @@ env:
   KSU_NEXT_BRANCH: "dev-susfs"
   SUSFS_REPO: "https://gitlab.com/simonpunk/susfs4ksu.git"
   SUSFS_BRANCH: "gki-android12-5.10"
+  SUSFS_FALLBACK_COMMIT: "86114db0c49f20fa7857b8b559f3ab87cbc2d00d"
 
 jobs:
   build:
@@ -108,46 +109,48 @@ jobs:
           SUBLEVEL="$(grep -m1 '^SUBLEVEL = ' common/Makefile | awk '{print $3}')"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
-      - name: Clone SUSFS4KSU (auto latest)
+      - name: Clone SUSFS4KSU (try latest, fallback if broken)
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          git clone --depth 1 -b "${SUSFS_BRANCH}" "${SUSFS_REPO}" susfs4ksu
-          cd susfs4ksu
+          # If user provided a commit, use it directly
           if [ -n "${{ github.event.inputs.susfs_commit }}" ]; then
+            git clone --depth 1 -b "${SUSFS_BRANCH}" "${SUSFS_REPO}" susfs4ksu
+            cd susfs4ksu
             git fetch --depth 1 origin "${{ github.event.inputs.susfs_commit }}"
             git checkout "${{ github.event.inputs.susfs_commit }}"
+            echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+            echo "Using user-provided SUSFS commit"
+            exit 0
           fi
-          echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - name: Verify SUSFS headers are complete
-        working-directory: kernel_workspace/susfs4ksu
-        run: |
-          set -euo pipefail
-          FAILED="false"
+          # Otherwise: try auto latest
+          git clone --depth 1 -b "${SUSFS_BRANCH}" "${SUSFS_REPO}" susfs4ksu
+          cd susfs4ksu
+          echo "Cloned latest, checking if constants are defined..."
+
+          # Check for required constants in susfs.h and susfs_def.h
+          MISSING="false"
           for CONST in SUSFS_MAX_LEN_PATHNAME SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE SUSFS_ENABLED_FEATURES_SIZE; do
-            if grep -q "${CONST}" kernel_patches/include/linux/susfs.h 2>/dev/null; then
-              echo "OK: ${CONST}"
-            else
-              echo "ERROR: ${CONST} missing from susfs.h"
-              FAILED="true"
+            if ! grep -q "${CONST}" kernel_patches/include/linux/susfs.h 2>/dev/null; then
+              echo "Missing in susfs.h: ${CONST}"
+              MISSING="true"
             fi
           done
-          if [ -f kernel_patches/include/linux/susfs_def.h ]; then
-            if grep -q 'define SUSFS_MAX_LEN_PATHNAME' kernel_patches/include/linux/susfs_def.h; then
-              echo "OK: SUSFS_MAX_LEN_PATHNAME defined in susfs_def.h"
-            else
-              echo "ERROR: SUSFS_MAX_LEN_PATHNAME not defined"
-              FAILED="true"
-            fi
+          if [ ! -f kernel_patches/include/linux/susfs_def.h ] || ! grep -q 'define SUSFS_MAX_LEN_PATHNAME' kernel_patches/include/linux/susfs_def.h; then
+            echo "Missing in susfs_def.h: SUSFS_MAX_LEN_PATHNAME"
+            MISSING="true"
+          fi
+
+          if [ "$MISSING" = "true" ]; then
+            echo "Auto-latest is broken. Falling back to pinned commit ${SUSFS_FALLBACK_COMMIT}"
+            git fetch --depth 1 origin "${SUSFS_FALLBACK_COMMIT}"
+            git checkout "${SUSFS_FALLBACK_COMMIT}"
           else
-            echo "ERROR: susfs_def.h not found"
-            FAILED="true"
+            echo "Auto-latest is complete. Using latest."
           fi
-          if [ "${FAILED}" = "true" ]; then
-            echo "SUSFS auto-latest branch is broken. Pin to 86114db0c49f20fa7857b8b559f3ab87cbc2d00d"
-            exit 1
-          fi
+          echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SUSFS commit: $(git rev-parse HEAD) — $(git log -1 --format=%s)"
 
       - name: Set SUSFS kernel configs
         run: |
