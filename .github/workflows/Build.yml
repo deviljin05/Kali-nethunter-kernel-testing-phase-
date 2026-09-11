@@ -1,38 +1,43 @@
-name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3 + RTL8XXXU + HID/CAN)
+name: Build Custom GKI Kernel
 
 on:
   workflow_dispatch:
     inputs:
       os_patch_level:
-        description: "'lts' = rolling LTS branch. Or pin an exact GKI release tag, e.g. android12-5.10.264_r00"
+        description: "'lts' or exact GKI tag (e.g. android12-5.10.264_r00)"
         required: true
         default: "android12-5.10.264_r00"
       susfs_commit:
-        description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch)"
+        description: "SUSFS commit (empty = auto latest)"
+        required: false
+        default: ""
+      ksu_commit:
+        description: "KernelSU-Next commit (empty = auto latest)"
         required: false
         default: ""
       device_name:
-        description: "Optional label for artifact naming"
+        description: "Artifact label"
         required: false
         default: "gki-custom"
       enable_bbg:
-        description: "Enable Baseband Guard (BBG)"
+        description: "Enable Baseband Guard"
         required: true
         default: "true"
       enable_hid:
-        description: "Enable full USB HID gadget support"
+        description: "Enable USB HID gadget"
         required: true
         default: "true"
       enable_can:
-        description: "Enable CAN bus support"
+        description: "Enable CAN bus"
         required: true
         default: "true"
 
 env:
   VERSION: android12-5.10
   CCACHE_DIR: /home/runner/.ccache
-  # KernelSU-Next commit from WildKernels Release r16 (latest verified)
-  KSU_NEXT_COMMIT: "3438d6aa431f96a23f9e625bec3d53ce1fb14161"
+  KSU_NEXT_REPO: "https://github.com/pershoot/KernelSU-Next.git"
+  KSU_NEXT_BRANCH: "dev-susfs"
+  SUSFS_REPO: "https://gitlab.com/simonpunk/susfs4ksu.git"
   SUSFS_BRANCH: "gki-android12-5.10"
 
 jobs:
@@ -40,8 +45,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Free up disk space
         run: |
@@ -67,19 +71,16 @@ jobs:
       - name: Set up ccache
         run: mkdir -p "${{ env.CCACHE_DIR }}"
 
-      - name: Resolve manifest branch and optional pinned release tag
+      - name: Resolve manifest branch and pin tag
         run: |
           set -euo pipefail
           INPUT="${{ github.event.inputs.os_patch_level }}"
           if [ "${INPUT}" = "lts" ]; then
             MANIFEST_REF="common-${{ env.VERSION }}-lts"
             PIN_TAG=""
-            echo "Tracking rolling LTS branch: ${MANIFEST_REF}"
           else
             MANIFEST_REF="common-${{ env.VERSION }}"
             PIN_TAG="${INPUT}"
-            echo "Manifest branch for sync: ${MANIFEST_REF}"
-            echo "Will pin kernel_workspace/common to release tag: ${PIN_TAG}"
           fi
           echo "MANIFEST_REF=${MANIFEST_REF}" >> "$GITHUB_ENV"
           echo "PIN_TAG=${PIN_TAG}" >> "$GITHUB_ENV"
@@ -92,90 +93,61 @@ jobs:
             -b "${MANIFEST_REF}" --depth=1
           repo sync -c --current-branch --no-clone-bundle --no-tags -j"$(nproc)"
 
-      - name: Pin kernel/common to exact release tag (if requested)
+      - name: Pin kernel/common to release tag
         if: ${{ env.PIN_TAG != '' }}
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           REMOTE_NAME="$(git remote | head -n1)"
-          if [ -z "${REMOTE_NAME}" ]; then
-            echo "::error::No git remote found in kernel_workspace/common — cannot fetch pinned tag"
-            exit 1
-          fi
           git fetch --depth=1 "${REMOTE_NAME}" "refs/tags/${PIN_TAG}:refs/tags/${PIN_TAG}"
           git checkout "refs/tags/${PIN_TAG}"
-          echo "Now on: $(git describe --tags --always) ($(git rev-parse HEAD))"
 
       - name: Detect kernel sublevel
         working-directory: kernel_workspace
         run: |
           SUBLEVEL="$(grep -m1 '^SUBLEVEL = ' common/Makefile | awk '{print $3}')"
-          echo "Detected SUBLEVEL: $SUBLEVEL"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
-      # ================================================================
-      #  SUSFS CLONE — AUTO LATEST (as requested)
-      #  No commit pin. Uses whatever is HEAD on gki-android12-5.10
-      # ================================================================
-      - name: Clone SUSFS4KSU (auto latest on gki-android12-5.10 branch)
+      - name: Clone SUSFS4KSU (auto latest)
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          git clone --depth 1 -b "${SUSFS_BRANCH}" https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          git clone --depth 1 -b "${SUSFS_BRANCH}" "${SUSFS_REPO}" susfs4ksu
           cd susfs4ksu
           if [ -n "${{ github.event.inputs.susfs_commit }}" ]; then
             git fetch --depth 1 origin "${{ github.event.inputs.susfs_commit }}"
             git checkout "${{ github.event.inputs.susfs_commit }}"
           fi
           echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          echo "SUSFS commit in use: $(git rev-parse HEAD) — $(git log -1 --format=%s)"
 
-      # ================================================================
-      #  SAFETY VERIFICATION — catches broken auto-latest before build
-      # ================================================================
-      - name: Verify SUSFS header contains all required constants
+      - name: Verify SUSFS headers are complete
         working-directory: kernel_workspace/susfs4ksu
         run: |
           set -euo pipefail
-          echo "=== Verifying SUSFS kernel_patches headers ==="
           FAILED="false"
-
-          # Check susfs.h for critical constants
           for CONST in SUSFS_MAX_LEN_PATHNAME SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE SUSFS_ENABLED_FEATURES_SIZE; do
             if grep -q "${CONST}" kernel_patches/include/linux/susfs.h 2>/dev/null; then
-              echo "✓ ${CONST} found in susfs.h"
+              echo "OK: ${CONST}"
             else
-              echo "::error::${CONST} NOT found in susfs.h — SUSFS branch is incomplete!"
+              echo "ERROR: ${CONST} missing from susfs.h"
               FAILED="true"
             fi
           done
-
-          # Check susfs_def.h exists and contains definitions
           if [ -f kernel_patches/include/linux/susfs_def.h ]; then
-            echo "✓ susfs_def.h exists"
             if grep -q 'define SUSFS_MAX_LEN_PATHNAME' kernel_patches/include/linux/susfs_def.h; then
-              echo "✓ SUSFS_MAX_LEN_PATHNAME is defined in susfs_def.h"
+              echo "OK: SUSFS_MAX_LEN_PATHNAME defined in susfs_def.h"
             else
-              echo "::error::SUSFS_MAX_LEN_PATHNAME NOT defined in susfs_def.h"
+              echo "ERROR: SUSFS_MAX_LEN_PATHNAME not defined"
               FAILED="true"
             fi
           else
-            echo "::error::susfs_def.h NOT found"
+            echo "ERROR: susfs_def.h not found"
             FAILED="true"
           fi
-
           if [ "${FAILED}" = "true" ]; then
-            echo ""
-            echo "============================================================"
-            echo "SUSFS AUTO-LATEST IS BROKEN"
-            echo "============================================================"
-            echo "The gki-android12-5.10 branch HEAD is incomplete."
-            echo "Please pin to a known-good commit:"
-            echo "  86114db0c49f20fa7857b8b559f3ab87cbc2d00d (WildKernels r5)"
-            echo "============================================================"
+            echo "SUSFS auto-latest branch is broken. Pin to 86114db0c49f20fa7857b8b559f3ab87cbc2d00d"
             exit 1
           fi
-          echo "=== SUSFS header verification PASSED ==="
 
       - name: Set SUSFS kernel configs
         run: |
@@ -201,7 +173,7 @@ jobs:
           cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
           cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./
 
-      - name: Apply android12-5.10 pre-patch compatibility fixes
+      - name: Apply pre-patch compatibility fixes
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
@@ -219,26 +191,22 @@ jobs:
         run: |
           set -euo pipefail
           if ! patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch; then
-            echo "::error::SUSFS patch failed to apply cleanly — .rej files below:"
             find . -name "*.rej"
             exit 1
           fi
 
-      - name: Ensure susfs.h is included wherever susfs_ symbols are used
+      - name: Ensure susfs.h included everywhere
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          echo "=== Scanning for susfs_* usages ==="
           FILES_TO_FIX="$(grep -rlE '\bsusfs_[a-zA-Z0-9_]+\b' --include='*.c' --include='*.h' . | sort -u || true)"
           for f in $FILES_TO_FIX; do
             case "$f" in
               */include/linux/susfs.h|*/fs/susfs.c|*/fs/susfs*)
-                echo "✓ Skipping $f (SUSFS source/header)"
                 continue
                 ;;
             esac
             if ! grep -q '#include <linux/susfs.h>' "$f"; then
-              echo "Adding missing #include <linux/susfs.h> to $f"
               LAST_INCLUDE_LINE="$(grep -n '^#include' "$f" | tail -1 | cut -d: -f1 || true)"
               if [ -n "${LAST_INCLUDE_LINE}" ]; then
                 sed -i "${LAST_INCLUDE_LINE}a #include <linux/susfs.h>" "$f"
@@ -247,21 +215,18 @@ jobs:
               fi
             fi
           done
-          # Safety net: fs/statfs.c
           if [ -f fs/statfs.c ] && grep -q 'susfs_sus_kstat_spoof_vfs_statfs' fs/statfs.c; then
             if ! grep -q '#include <linux/susfs.h>' fs/statfs.c; then
               sed -i "1i #include <linux/susfs.h>" fs/statfs.c
-              echo "✓ Added susfs.h to fs/statfs.c"
             fi
           fi
 
-      - name: Fix SUSFS set_nameidata argument mismatch
+      - name: Fix set_nameidata argument mismatch
         working-directory: kernel_workspace/common
         run: |
-          set -euo pipefail
           sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' fs/namei.c
 
-      - name: Revert android12-5.10 pre-patch compatibility fixes
+      - name: Revert pre-patch compatibility fixes
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
@@ -274,43 +239,39 @@ jobs:
             perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
           fi
 
-      - name: Apply SUSFS show_pad fix (older sublevels only)
+      - name: Apply show_pad fix
         working-directory: kernel_workspace/common
         run: |
           if [ "${SUBLEVEL}" -le "209" ]; then
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      # ================================================================
-      #  KERNELSU-NEXT — PINNED COMMIT (verified from Release r16)
-      # ================================================================
-      - name: Setup KernelSU-Next (pinned commit from Release r16)
+      - name: Setup KernelSU-Next (auto latest)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          git clone https://github.com/pershoot/KernelSU-Next.git -b dev-susfs KernelSU-Next
+          git clone "${KSU_NEXT_REPO}" -b "${KSU_NEXT_BRANCH}" KernelSU-Next
           cd KernelSU-Next
-          git checkout "${KSU_NEXT_COMMIT}"
+          if [ -n "${{ github.event.inputs.ksu_commit }}" ]; then
+            git checkout "${{ github.event.inputs.ksu_commit }}"
+          fi
+          echo "KSU_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           cd ..
-          echo "✓ KernelSU-Next checked out at ${KSU_NEXT_COMMIT}"
-          bash KernelSU-Next/kernel/setup.sh dev-susfs
+          bash KernelSU-Next/kernel/setup.sh "${KSU_NEXT_BRANCH}"
 
-      # static.patch REMOVED — already fixed upstream in dev-susfs branch
-
-      - name: Relax KernelSU Kbuild check for mrproper phase
+      - name: Relax KernelSU Kbuild check
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           KB="drivers/kernelsu/Kbuild"
           if [ ! -f "$KB" ]; then
-            echo "::warning::KernelSU Kbuild not found — skipping"
             exit 0
           fi
           cp "$KB" "${KB}.orig"
           sed -i 's|\$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")|$(warning "KernelSU: configs not visible during clean phase, non-fatal")|g' "$KB"
           sed -i 's|error "KernelSU requires|warning "KernelSU requires|g' "$KB"
 
-      - name: Install Baseband Guard (BBG)
+      - name: Install Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         working-directory: kernel_workspace
         run: |
@@ -329,25 +290,18 @@ jobs:
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          if grep -q "baseband_guard" common/security/Kconfig; then
-            echo "✓ BBG registered in common/security/Kconfig"
-          else
-            echo "::error::baseband_guard not found in common/security/Kconfig"
-            exit 1
-          fi
+          grep -q "baseband_guard" common/security/Kconfig || exit 1
 
       - name: Record BBG version
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         working-directory: kernel_workspace/Baseband-guard
         run: |
-          BBG_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-          echo "BBG_COMMIT=${BBG_COMMIT}" >> "$GITHUB_ENV"
+          echo "BBG_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
 
       - name: Enable BBG config
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          echo "CONFIG_BBG=y" >> gki_defconfig
+          echo "CONFIG_BBG=y" >> kernel_workspace/common/arch/arm64/configs/gki_defconfig
 
       - name: Apply BBRv3 backport
         working-directory: kernel_workspace/common
@@ -365,21 +319,19 @@ jobs:
                 BBR_CONG_NAME="$DETECTED"
               fi
             else
-              echo "::warning::BBRv3 patch had rejects"
               find . -name "*.rej"
             fi
           fi
           echo "BBR_CONG_NAME=${BBR_CONG_NAME}" >> "$GITHUB_ENV"
           echo "BBRV3_PATCH_APPLIED=${BBRV3_PATCH_APPLIED}" >> "$GITHUB_ENV"
-
           if ! grep -qF 'int proc_dou8vec_minmax(' ./include/linux/sysctl.h; then
             for p in sysctl_add_proc_dou8vec_minmax.patch sysctl_fix_data-races_in_proc_dou8vec_minmax.patch; do
               PF="/tmp/wildpatches/common/bbrv3/$p"
-              [ -f "$PF" ] && { patch -p1 < "$PF" || echo "::warning::$p did not apply cleanly"; }
+              [ -f "$PF" ] && { patch -p1 < "$PF" || true; }
             done
           fi
 
-      - name: Set networking / TCP congestion configs
+      - name: Set networking / TCP configs
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
@@ -405,52 +357,42 @@ jobs:
           if [ "${SUBLEVEL}" -le "208" ]; then
             curl -LSs -o /tmp/0003-lockdep-assert-none-held.patch \
               https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/ntsync/patches/0003-lockdep-assert-none-held.patch
-            patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || echo "::warning::lockdep fix did not apply"
+            patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || true
           fi
-
           curl -LSs -o /tmp/ntsync_compat_android12-5.10.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_compat_android12-5.10.patch
-          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || echo "::warning::ntsync compat patch had rejects"
-
+          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || true
           curl -LSs -o /tmp/ntsync_base.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_base.patch
-          patch -p1 < /tmp/ntsync_base.patch || echo "::warning::ntsync base patch had rejects"
-
+          patch -p1 < /tmp/ntsync_base.patch || true
           echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
 
-      - name: Apply Droidspaces kABI-safe patches (SYSVIPC + POSIX_MQUEUE)
+      - name: Apply Droidspaces kABI patches
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           DROIDSPACES_KABI_OK="true"
-
           curl -LSs -o /tmp/droidspaces_sysvipc_kabi.patch \
             https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
           if ! patch -p1 < /tmp/droidspaces_sysvipc_kabi.patch; then
-            echo "::warning::Droidspaces SYSVIPC kABI patch had rejects"
             find . -name "*.rej"
             DROIDSPACES_KABI_OK="false"
           fi
-
           curl -LSs -o /tmp/droidspaces_posix_mqueue_kabi.patch \
             https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
           if ! patch -p1 < /tmp/droidspaces_posix_mqueue_kabi.patch; then
-            echo "::warning::Droidspaces POSIX_MQUEUE kABI patch had rejects"
             find . -name "*.rej"
             DROIDSPACES_KABI_OK="false"
           fi
-
           echo "DROIDSPACES_KABI_OK=${DROIDSPACES_KABI_OK}" >> "$GITHUB_ENV"
 
-      - name: Set Droidspaces (container runtime) configs
+      - name: Set Droidspaces configs
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           if [ "${DROIDSPACES_KABI_OK}" = "true" ]; then
-            {
-              echo "CONFIG_SYSVIPC=y"
-              echo "CONFIG_POSIX_MQUEUE=y"
-              echo "CONFIG_IPC_NS=y"
-            } >> gki_defconfig
+            echo "CONFIG_SYSVIPC=y" >> gki_defconfig
+            echo "CONFIG_POSIX_MQUEUE=y" >> gki_defconfig
+            echo "CONFIG_IPC_NS=y" >> gki_defconfig
           fi
           {
             echo "CONFIG_NAMESPACES=y"
@@ -471,7 +413,7 @@ jobs:
             echo "CONFIG_TMPFS_XATTR=y"
           } >> gki_defconfig
 
-      - name: Set full USB HID gadget configs
+      - name: Set USB HID gadget configs
         if: ${{ github.event.inputs.enable_hid == 'true' }}
         run: |
           cd kernel_workspace/common/arch/arm64/configs
@@ -526,7 +468,7 @@ jobs:
             echo "CONFIG_CAN_UCAN=y"
           } >> gki_defconfig
 
-      - name: Set IIO / PCI endpoint configfs configs
+      - name: Set IIO / PCI endpoint configs
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
@@ -536,7 +478,7 @@ jobs:
             echo "CONFIG_PCI_ENDPOINT_CONFIGFS=y"
           } >> gki_defconfig
 
-      - name: Set USB Wi-Fi adapter driver configs (RTL8188/rtl8xxxu family)
+      - name: Set RTL8XXXU Wi-Fi configs
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
@@ -548,16 +490,16 @@ jobs:
             echo "CONFIG_RTL8XXXU=y"
           } >> gki_defconfig
 
-      - name: Apply custom kernel branding
+      - name: Apply kernel branding
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           mv scripts/setlocalversion scripts/setlocalversion.orig
           chmod +x scripts/setlocalversion.orig
-          cat > scripts/setlocalversion << 'SETLOCALVERSION_EOF'
+          cat > scripts/setlocalversion << 'EOF'
           #!/bin/sh
           printf -- '-BLAZE-KSUNv1-STABLE\n'
-          SETLOCALVERSION_EOF
+          EOF
           chmod +x scripts/setlocalversion
 
       - name: Disable strict defconfig verification
@@ -576,32 +518,23 @@ jobs:
           CCACHE_DIR="${{ env.CCACHE_DIR }}" \
           build/build.sh -j"$(nproc)"
 
-      - name: Verify namespace / cgroup configs made it into the final .config
+      - name: Verify critical configs in .config
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
           CFG=$(find out -name ".config" | head -n1)
-          if [ -z "$CFG" ]; then
-            echo "::error::Could not find a compiled .config"
-            exit 1
-          fi
+          [ -z "$CFG" ] && exit 1
           FAILED="false"
           for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS; do
             if grep -q "^${SYM}=y$" "$CFG"; then
-              echo "✓ ${SYM}=y confirmed"
+              echo "OK: ${SYM}=y"
             else
-              echo "::error::${SYM} is NOT enabled"
+              echo "ERROR: ${SYM} not enabled"
               FAILED="true"
             fi
           done
-          if grep -qE "^CONFIG_RTL8XXXU=(y|m)$" "$CFG"; then
-            echo "✓ CONFIG_RTL8XXXU confirmed"
-          else
-            echo "::warning::CONFIG_RTL8XXXU not enabled"
-          fi
-          if [ "${FAILED}" = "true" ]; then
-            exit 1
-          fi
+          grep -qE "^CONFIG_RTL8XXXU=(y|m)$" "$CFG" && echo "OK: RTL8XXXU enabled"
+          [ "${FAILED}" = "true" ] && exit 1
 
       - name: Locate built Image
         working-directory: kernel_workspace
@@ -611,10 +544,7 @@ jobs:
           if [ -z "$IMG" ]; then
             IMG=$(find out -name "Image" | head -n1)
           fi
-          if [ -z "$IMG" ]; then
-            echo "::error::No kernel Image found"
-            exit 1
-          fi
+          [ -z "$IMG" ] && exit 1
           echo "IMG_PATH=kernel_workspace/${IMG}" >> "$GITHUB_ENV"
 
       - name: Package AnyKernel3
@@ -623,7 +553,7 @@ jobs:
           git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 ak3
           cp "${{ env.IMG_PATH }}" ak3/Image
           cd ak3
-          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
+          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-susfs.zip" . -x ".git*"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
