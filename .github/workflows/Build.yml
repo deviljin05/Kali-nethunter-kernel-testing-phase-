@@ -1,25 +1,11 @@
 name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3 + RTL8XXXU + HID/CAN)
 # ============================================================================
-# Base = working sample (verbatim flow).
-# Additions (as pure additions before branding step):
+# Base = working sample (verbatim). Additions (pure additions, before
+# branding step):
 #  - USB HID gadget support    (toggle: enable_hid)
 #  - CAN bus support           (toggle: enable_can)
 #  - IIO / PCI endpoint configfs
-#  - RTL8XXXU Wi-Fi (=y built-in; AnyKernel3 only ships Image, =m useless)
-#
-# Fixes required because current upstream BBG + KernelSU-Next dev-susfs
-# trips checks that didn't exist when the sample was last green:
-#  A) ld symlink        -> BBG flask.h gen needs bare "ld" (AOSP clang
-#                          only ships ld.lld)
-#  B) Kbuild $(error)   -> "KernelSU requires either CONFIG_KPROBES=y or
-#                          CONFIG_KSU_SUSFS=y" fires during mrproper when
-#                          .config isn't loaded yet; downgrade to $(warning)
-#  C) KMI/ABI relax     -> our additions export non-reference symbols;
-#                          strict KMI aborts at final link with bare
-#                          "make: *** Error 2" and no visible cause
-#  C2) modpost relax    -> KBUILD_MODPOST_WARN=1 downgrades modpost errors
-#  D) Diagnostic build  -> capture full build log and print the REAL error
-#                          (not just the make summary) if the build fails
+#  - RTL8XXXU Wi-Fi (=y built-in; AnyKernel3 only ships Image)
 # ============================================================================
 
 on:
@@ -133,30 +119,6 @@ jobs:
           echo "Detected SUBLEVEL: $SUBLEVEL"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
-      # -----------------------------------------------------------------
-      # FIX A: clang-12 "Executable ld doesn't exist" — AOSP clang ships
-      # ld.lld but BBG's flask.h regeneration invokes bare "ld".
-      # -----------------------------------------------------------------
-      - name: Fix A — symlink ld -> ld.lld in clang prebuilts
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          FOUND=0
-          for BASE in prebuilts-master/clang prebuilts/clang; do
-            [ -d "$BASE" ] || continue
-            while IFS= read -r BIN; do
-              [ -z "$BIN" ] && continue
-              if [ -e "${BIN}/ld.lld" ] && [ ! -e "${BIN}/ld" ]; then
-                ln -sf "${BIN}/ld.lld" "${BIN}/ld"
-                echo "Linked ${BIN}/ld -> ld.lld"
-                FOUND=1
-              fi
-            done < <(find "$BASE" -type d -name bin 2>/dev/null)
-          done
-          if [ "$FOUND" = "0" ]; then
-            echo "::warning::No clang bin dir found for ld symlink"
-          fi
-
       - name: Clone SUSFS4KSU (latest = current SUSFS release)
         working-directory: kernel_workspace
         run: |
@@ -220,12 +182,7 @@ jobs:
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          if grep -q 'set_nameidata(nd, old_dfd, fake_filename, NULL);' fs/namei.c; then
-            sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' fs/namei.c
-            echo "Applied 4-arg -> 3-arg set_nameidata fix"
-          else
-            echo "4-arg set_nameidata not found — skipping (already correct form)"
-          fi
+          sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' fs/namei.c
 
       - name: Revert android12-5.10 pre-patch compatibility fixes
         working-directory: kernel_workspace/common
@@ -260,37 +217,6 @@ jobs:
           curl -LSs -o static.patch \
             https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/kernelsu/patches/static.patch
           patch -p1 --forward < static.patch || echo "::warning::static.patch did not apply — may already be fixed upstream, not fatal"
-
-      # -----------------------------------------------------------------
-      # FIX B: mrproper-time KernelSU Kbuild $(error) -> $(warning).
-      # The check fires before .config is loaded, so KPROBES/KSU_SUSFS
-      # are both empty even on a correctly-configured tree.
-      # -----------------------------------------------------------------
-      - name: Fix B — relax KernelSU Kbuild check for mrproper phase
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          KB="drivers/kernelsu/Kbuild"
-          if [ ! -f "$KB" ]; then
-            echo "::warning::KernelSU Kbuild not found at $KB — skipping"
-            exit 0
-          fi
-          if grep -q "BLAZE_KBUILD_PATCHED" "$KB"; then
-            echo "Kbuild already patched, skipping"
-            exit 0
-          fi
-          cp "$KB" "${KB}.orig"
-          sed -i 's|\$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")|$(warning "KernelSU: configs not visible (likely mrproper/clean phase, non-fatal)")|g' "$KB"
-          sed -i 's|error "KernelSU requires|warning "KernelSU requires|g' "$KB"
-          sed -i '1i # BLAZE_KBUILD_PATCHED: $(error ...) -> $(warning ...) for mrproper compat' "$KB"
-          echo "--- Patched Kbuild head ---"
-          head -15 "$KB"
-          if grep -q 'error "KernelSU requires' "$KB"; then
-            echo "::warning::Patch may not have caught all instances:"
-            grep -n 'KernelSU requires' "$KB" || true
-          else
-            echo "✓ Kbuild error -> warning patch applied"
-          fi
 
       - name: Install Baseband Guard (BBG)
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -355,7 +281,6 @@ jobs:
           else
             echo "::warning::BBRv3 patch not found at expected path"
           fi
-          [ -z "$BBR_CONG_NAME" ] && BBR_CONG_NAME="bbr"
           echo "Detected default TCP congestion control name: ${BBR_CONG_NAME}"
           echo "BBRv3 patch applied: ${BBRV3_PATCH_APPLIED}"
           echo "BBR_CONG_NAME=${BBR_CONG_NAME}" >> "$GITHUB_ENV"
@@ -399,11 +324,11 @@ jobs:
 
           curl -LSs -o /tmp/ntsync_compat_android12-5.10.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_compat_android12-5.10.patch
-          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || { echo "::warning::ntsync compat patch had rejects:"; find . -name "*.rej"; }
+          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || echo "::warning::ntsync compat patch had rejects — check .rej"
 
           curl -LSs -o /tmp/ntsync_base.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_base.patch
-          patch -p1 < /tmp/ntsync_base.patch || { echo "::warning::ntsync base patch had rejects:"; find . -name "*.rej"; }
+          patch -p1 < /tmp/ntsync_base.patch || echo "::warning::ntsync base patch had rejects — check .rej"
 
           echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
 
@@ -464,7 +389,7 @@ jobs:
           } >> gki_defconfig
 
       # ===================================================================
-      # NAYE ADDITIONS (working sample se sirf yeh 4 steps naye hain)
+      # NAYE ADDITIONS — bas yeh 4 steps naye hain
       # ===================================================================
 
       - name: Set full USB HID gadget configs
@@ -563,89 +488,21 @@ jobs:
           SETLOCALVERSION_EOF
           chmod +x scripts/setlocalversion
 
-      # -----------------------------------------------------------------
-      # FIX C: disable strict defconfig verification AND KMI/ABI
-      # enforcement. NOTE: previous version used `sed -E 's/(...)/\10/'`
-      # which GNU sed parses as backref-10 (invalid) and silently no-ops,
-      # leaving KMI_ENFORCED=1 in place. This version does explicit
-      # full-line replacement + append-if-missing, so it actually works.
-      # -----------------------------------------------------------------
-      - name: Fix C — disable strict defconfig + KMI/ABI enforcement
+      - name: Disable strict defconfig verification
+        working-directory: kernel_workspace
+        run: sed -i 's/check_defconfig//' ./common/build.config.gki
+
+      - name: Build kernel
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          sed -i 's/check_defconfig//' ./common/build.config.gki
-
-          for cfg in common/build.config.gki.aarch64 common/build.config.gki; do
-            [ -f "$cfg" ] || continue
-            sed -i 's/^KMI_SYMBOL_LIST_STRICT_MODE=.*/KMI_SYMBOL_LIST_STRICT_MODE=0/' "$cfg" || true
-            sed -i 's/^KMI_ENFORCED=.*/KMI_ENFORCED=0/' "$cfg" || true
-            sed -i 's/^TRIM_NONLISTED_KMI=.*/TRIM_NONLISTED_KMI=0/' "$cfg" || true
-            grep -q '^KMI_SYMBOL_LIST_STRICT_MODE=' "$cfg" || echo 'KMI_SYMBOL_LIST_STRICT_MODE=0' >> "$cfg"
-            grep -q '^KMI_ENFORCED='                 "$cfg" || echo 'KMI_ENFORCED=0'                 >> "$cfg"
-            grep -q '^TRIM_NONLISTED_KMI='           "$cfg" || echo 'TRIM_NONLISTED_KMI=0'           >> "$cfg"
-            echo "--- $cfg after edit ---"
-            grep -nE '^(KMI_|TRIM_|MODULES_ORDER)' "$cfg" || true
-          done
-
-          find common -maxdepth 2 -name 'build.config*' -type f | while read -r f; do
-            sed -i 's/^KMI_SYMBOL_LIST_STRICT_MODE=.*/KMI_SYMBOL_LIST_STRICT_MODE=0/' "$f" 2>/dev/null || true
-            sed -i 's/^KMI_ENFORCED=.*/KMI_ENFORCED=0/' "$f" 2>/dev/null || true
-            sed -i 's/^TRIM_NONLISTED_KMI=.*/TRIM_NONLISTED_KMI=0/' "$f" 2>/dev/null || true
-          done
-
-      # -----------------------------------------------------------------
-      # Diagnostic build step: captures full log to /tmp/build.log, and on
-      # failure prints the REAL error (not just the make summary), so we
-      # don't have to guess what's failing at the link stage anymore.
-      # -----------------------------------------------------------------
-      - name: Build kernel
-        working-directory: kernel_workspace
-        env:
-          KMI_SYMBOL_LIST_STRICT_MODE: "0"
-          KMI_ENFORCED: "0"
-          TRIM_NONLISTED_KMI: "0"
-          # Downgrade modpost hard errors to warnings — a common cause of
-          # "make: *** Error 2" when new features reference new symbols.
-          KBUILD_MODPOST_WARN: "1"
-        run: |
-          set -uo pipefail
-          # NOT `set -e` on purpose: we want to capture the real error from
-          # the log before failing, not just the make summary.
-          CLANG_BIN="$(find prebuilts-master/clang -type d -name bin 2>/dev/null | head -n1 || true)"
-          [ -n "$CLANG_BIN" ] && export PATH="${CLANG_BIN}:${PATH}"
           export KBUILD_BUILD_USER="builder"
           export KBUILD_BUILD_HOST="ci"
-
-          LOG=/tmp/build.log
-          set +e
           LTO=thin \
           BUILD_CONFIG=common/build.config.gki.aarch64 \
           USE_CCACHE=1 \
           CCACHE_DIR="${{ env.CCACHE_DIR }}" \
-          build/build.sh -j"$(nproc)" 2>&1 | tee "$LOG"
-          RC=${PIPESTATUS[0]}
-          set -e
-
-          if [ "$RC" -ne 0 ]; then
-            echo "::group::REAL ERROR CONTEXT (grep of build log)"
-            grep -nE 'error:|fatal error:|undefined reference|undefined symbol|multiple definition|ERROR: modpost|ERROR: |\*\*\*|\.rej|abigail|dwarf|KMI|ABI' "$LOG" | tail -n120 || true
-            echo "::endgroup::"
-
-            echo "::group::LAST 150 LINES OF BUILD LOG"
-            tail -n150 "$LOG" || true
-            echo "::endgroup::"
-
-            echo "::group::Lines just above the final make error"
-            ERR_LINE=$(grep -n 'make: \*\*\*' "$LOG" | head -n1 | cut -d: -f1 || true)
-            if [ -n "$ERR_LINE" ]; then
-              START=$(( ERR_LINE > 40 ? ERR_LINE - 40 : 1 ))
-              sed -n "${START},${ERR_LINE}p" "$LOG"
-            fi
-            echo "::endgroup::"
-
-            exit "$RC"
-          fi
+          build/build.sh -j"$(nproc)"
 
       - name: Verify namespace / cgroup configs made it into the final .config
         working-directory: kernel_workspace
@@ -662,7 +519,7 @@ jobs:
             if grep -q "^${SYM}=y$" "$CFG"; then
               echo "✓ ${SYM}=y confirmed in final .config"
             else
-              echo "::error::${SYM} is NOT enabled in the final .config — something downstream (vendor/board fragment) is overriding gki_defconfig. Actual line:"
+              echo "::error::${SYM} is NOT enabled in the final .config. Actual line:"
               grep -n "${SYM}" "$CFG" || echo "(no ${SYM} line found at all)"
               FAILED="true"
             fi
