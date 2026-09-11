@@ -50,7 +50,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git curl bc bison flex libssl-dev \
             build-essential python3 python3-pip libncurses-dev \
-            ccache zip unzip device-tree-compiler
+            ccache zip unzip device-tree-compiler patch
 
       - name: Install repo tool
         run: |
@@ -169,30 +169,30 @@ jobs:
             exit 1
           fi
 
-      # FIX: The previous version of this step only scanned files listed as
-      # touched in the SUSFS patch's diff headers ('+++ b/path.c'). That regex
-      # relied on the diff header ending exactly in '.c' with nothing after it,
-      # which silently fails to match when the patch has trailing whitespace,
-      # a CRLF line ending, or a timestamp after the filename (common in
-      # non-git-format patches). fs/statfs.c was missed this way, which is
-      # exactly what caused the build failure:
-      #   fs/statfs.c:89:6: error: implicit declaration of function
-      #   'susfs_sus_kstat_spoof_vfs_statfs'
-      #
-      # Instead of depending on parsing the patch header at all, scan every
-      # .c file in the tree directly for susfs_* symbol usage. This is
-      # immune to patch-format quirks and also protects against any other
-      # file (now or in future SUSFS releases) that calls a susfs_ helper
-      # without including the header.
+      # ================================================================
+      #  FIX: Add #include <linux/susfs.h> to EVERY file that uses susfs_*
+      #  This now explicitly handles fs/statfs.c (and any other file).
+      # ================================================================
       - name: Ensure susfs.h is included wherever susfs_ symbols are used
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          FILES_TO_FIX="$(grep -rlE '\bsusfs_[a-zA-Z0-9_]+\s*\(' --include='*.c' . | sort -u)"
+          echo "=== Scanning for susfs_* usages ==="
+          # Broader pattern: catches susfs_foo, susfs_foo_bar, susfs_foo123, etc.
+          FILES_TO_FIX="$(grep -rlE '\bsusfs_[a-zA-Z0-9_]+\b' --include='*.c' --include='*.h' . | sort -u || true)"
+
           if [ -z "${FILES_TO_FIX}" ]; then
             echo "No files found calling susfs_* functions — nothing to do."
           fi
+
           for f in $FILES_TO_FIX; do
+            # Skip the header itself and susfs source files (they already include it)
+            case "$f" in
+              */include/linux/susfs.h|*/fs/susfs.c|*/fs/susfs*)
+                echo "✓ Skipping $f (SUSFS source/header)"
+                continue
+                ;;
+            esac
             if ! grep -q '#include <linux/susfs.h>' "$f"; then
               echo "Adding missing #include <linux/susfs.h> to $f"
               LAST_INCLUDE_LINE="$(grep -n '^#include' "$f" | tail -1 | cut -d: -f1 || true)"
@@ -205,6 +205,34 @@ jobs:
               echo "✓ $f already includes linux/susfs.h"
             fi
           done
+
+          # ============================================================
+          #  SAFETY NET: Verify fs/statfs.c has the include (the exact
+          #  file that failed last time).
+          # ============================================================
+          echo "=== Verifying fs/statfs.c ==="
+          if [ -f fs/statfs.c ]; then
+            if grep -q 'susfs_sus_kstat_spoof_vfs_statfs' fs/statfs.c; then
+              if ! grep -q '#include <linux/susfs.h>' fs/statfs.c; then
+                echo "::warning::fs/statfs.c uses susfs_* but header is missing — adding manually"
+                LAST_INCLUDE_LINE="$(grep -n '^#include' fs/statfs.c | tail -1 | cut -d: -f1 || true)"
+                if [ -n "${LAST_INCLUDE_LINE}" ]; then
+                  sed -i "${LAST_INCLUDE_LINE}a #include <linux/susfs.h>" fs/statfs.c
+                else
+                  sed -i "1i #include <linux/susfs.h>" fs/statfs.c
+                fi
+              fi
+              echo "✓ fs/statfs.c now contains susfs.h include"
+            else
+              echo "ℹ fs/statfs.c does not reference susfs_sus_kstat_spoof_vfs_statfs (nothing to do)"
+            fi
+          else
+            echo "::warning::fs/statfs.c not found"
+          fi
+
+          echo "=== Final verification ==="
+          grep -n 'susfs_' fs/statfs.c | head -10 || true
+          grep -n '#include <linux/susfs.h>' fs/statfs.c || true
 
       - name: Fix SUSFS set_nameidata argument mismatch
         working-directory: kernel_workspace/common
@@ -246,9 +274,6 @@ jobs:
             https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/kernelsu/patches/static.patch
           patch -p1 --forward < static.patch || echo "::warning::static.patch did not apply — may already be fixed upstream, not fatal"
 
-      # Upstream KernelSU-Next has a $(error ...) in drivers/kernelsu/Kbuild that
-      # fires during `make mrproper`, before .config is loaded. Downgrade to a
-      # warning — the real build has the required configs set in gki_defconfig.
       - name: Relax KernelSU Kbuild check for mrproper phase
         working-directory: kernel_workspace/common
         run: |
