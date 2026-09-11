@@ -1,10 +1,4 @@
 name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3 + RTL8XXXU + HID/CAN)
-# ============================================================================
-# Base = working sample (verbatim) + 4 feature additions.
-# One minimal fix needed: KernelSU-Next upstream added a $(error ...) at
-# drivers/kernelsu/Kbuild:3 that fires during `make mrproper` (before
-# .config is loaded), aborting build.sh. Downgraded to $(warning ...).
-# ============================================================================
 
 on:
   workflow_dispatch:
@@ -105,7 +99,6 @@ jobs:
             echo "::error::No git remote found in kernel_workspace/common — cannot fetch pinned tag"
             exit 1
           fi
-          echo "Using remote '${REMOTE_NAME}' to fetch tag ${PIN_TAG}"
           git fetch --depth=1 "${REMOTE_NAME}" "refs/tags/${PIN_TAG}:refs/tags/${PIN_TAG}"
           git checkout "refs/tags/${PIN_TAG}"
           echo "Now on: $(git describe --tags --always) ($(git rev-parse HEAD))"
@@ -176,6 +169,28 @@ jobs:
             exit 1
           fi
 
+      # SUSFS's patch adds calls to susfs_* helpers (e.g. in fs/statfs.c) but does
+      # not always add the matching '#include <linux/susfs.h>' in every file it
+      # touches. Scan every file the patch modified and insert the include if a
+      # susfs_ symbol is used without it, instead of hardcoding one filename.
+      - name: Ensure susfs.h is included wherever susfs_ symbols are used
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          TOUCHED_FILES="$(grep -oP '^\+\+\+ b/\K\S+\.c$' 50_add_susfs_in_gki-android12-5.10.patch | sort -u)"
+          for f in $TOUCHED_FILES; do
+            [ -f "$f" ] || continue
+            if grep -qE '\bsusfs_[a-zA-Z0-9_]+\s*\(' "$f" && ! grep -q '#include <linux/susfs.h>' "$f"; then
+              echo "Adding missing #include <linux/susfs.h> to $f"
+              LAST_INCLUDE_LINE="$(grep -n '^#include' "$f" | tail -1 | cut -d: -f1 || true)"
+              if [ -n "${LAST_INCLUDE_LINE}" ]; then
+                sed -i "${LAST_INCLUDE_LINE}a #include <linux/susfs.h>" "$f"
+              else
+                sed -i "1i #include <linux/susfs.h>" "$f"
+              fi
+            fi
+          done
+
       - name: Fix SUSFS set_nameidata argument mismatch
         working-directory: kernel_workspace/common
         run: |
@@ -216,15 +231,9 @@ jobs:
             https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/kernelsu/patches/static.patch
           patch -p1 --forward < static.patch || echo "::warning::static.patch did not apply — may already be fixed upstream, not fatal"
 
-      # -----------------------------------------------------------------
-      # MINIMAL FIX: upstream KernelSU-Next now has $(error ...) at
-      # drivers/kernelsu/Kbuild:3 that fires during `make mrproper` before
-      # .config is loaded, aborting build.sh with:
-      #   *** "KernelSU requires either CONFIG_KPROBES=y or
-      #   CONFIG_KSU_SUSFS=y". Stop.
-      # Downgrade to $(warning ...) — the actual build has the configs set
-      # in gki_defconfig so the driver compiles fine.
-      # -----------------------------------------------------------------
+      # Upstream KernelSU-Next has a $(error ...) in drivers/kernelsu/Kbuild that
+      # fires during `make mrproper`, before .config is loaded. Downgrade to a
+      # warning — the real build has the required configs set in gki_defconfig.
       - name: Relax KernelSU Kbuild check for mrproper phase
         working-directory: kernel_workspace/common
         run: |
@@ -237,13 +246,11 @@ jobs:
           cp "$KB" "${KB}.orig"
           sed -i 's|\$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")|$(warning "KernelSU: configs not visible during clean phase, non-fatal")|g' "$KB"
           sed -i 's|error "KernelSU requires|warning "KernelSU requires|g' "$KB"
-          echo "--- Patched Kbuild head ---"
-          head -10 "$KB"
           if grep -q 'error "KernelSU requires' "$KB"; then
             echo "::warning::Patch incomplete:"
             grep -n 'KernelSU requires' "$KB" || true
           else
-            echo "✓ Kbuild $(error) -> $(warning) applied"
+            echo "✓ Kbuild \$(error) -> \$(warning) applied"
           fi
 
       - name: Install Baseband Guard (BBG)
@@ -267,7 +274,6 @@ jobs:
           set -euo pipefail
           if grep -q "baseband_guard" common/security/Kconfig; then
             echo "✓ BBG registered in common/security/Kconfig"
-            grep -n "baseband_guard" common/security/Kconfig || true
           else
             echo "::error::baseband_guard not found in common/security/Kconfig after setup — BBG install likely failed above"
             exit 1
@@ -309,8 +315,6 @@ jobs:
           else
             echo "::warning::BBRv3 patch not found at expected path"
           fi
-          echo "Detected default TCP congestion control name: ${BBR_CONG_NAME}"
-          echo "BBRv3 patch applied: ${BBRV3_PATCH_APPLIED}"
           echo "BBR_CONG_NAME=${BBR_CONG_NAME}" >> "$GITHUB_ENV"
           echo "BBRV3_PATCH_APPLIED=${BBRV3_PATCH_APPLIED}" >> "$GITHUB_ENV"
 
@@ -369,7 +373,7 @@ jobs:
           curl -LSs -o /tmp/droidspaces_sysvipc_kabi.patch \
             https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
           if ! patch -p1 < /tmp/droidspaces_sysvipc_kabi.patch; then
-            echo "::warning::Droidspaces SYSVIPC kABI patch had rejects — check .rej files below. Skipping CONFIG_SYSVIPC/CONFIG_IPC_NS/CONFIG_POSIX_MQUEUE to avoid a bootloop."
+            echo "::warning::Droidspaces SYSVIPC kABI patch had rejects — skipping CONFIG_SYSVIPC/CONFIG_IPC_NS/CONFIG_POSIX_MQUEUE to avoid a bootloop."
             find . -name "*.rej"
             DROIDSPACES_KABI_OK="false"
           fi
@@ -377,12 +381,11 @@ jobs:
           curl -LSs -o /tmp/droidspaces_posix_mqueue_kabi.patch \
             https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
           if ! patch -p1 < /tmp/droidspaces_posix_mqueue_kabi.patch; then
-            echo "::warning::Droidspaces POSIX_MQUEUE kABI patch had rejects — check .rej files below. Skipping CONFIG_SYSVIPC/CONFIG_IPC_NS/CONFIG_POSIX_MQUEUE to avoid a bootloop."
+            echo "::warning::Droidspaces POSIX_MQUEUE kABI patch had rejects — skipping CONFIG_SYSVIPC/CONFIG_IPC_NS/CONFIG_POSIX_MQUEUE to avoid a bootloop."
             find . -name "*.rej"
             DROIDSPACES_KABI_OK="false"
           fi
 
-          echo "Droidspaces kABI patches applied cleanly: ${DROIDSPACES_KABI_OK}"
           echo "DROIDSPACES_KABI_OK=${DROIDSPACES_KABI_OK}" >> "$GITHUB_ENV"
 
       - name: Set Droidspaces (container runtime) configs
@@ -415,10 +418,6 @@ jobs:
             echo "CONFIG_TMPFS_POSIX_ACL=y"
             echo "CONFIG_TMPFS_XATTR=y"
           } >> gki_defconfig
-
-      # ===================================================================
-      # NAYE ADDITIONS
-      # ===================================================================
 
       - name: Set full USB HID gadget configs
         if: ${{ github.event.inputs.enable_hid == 'true' }}
@@ -497,10 +496,6 @@ jobs:
             echo "CONFIG_RTL8XXXU=y"
           } >> gki_defconfig
 
-      # ===================================================================
-      # End of additions.
-      # ===================================================================
-
       - name: Apply custom kernel branding
         working-directory: kernel_workspace/common
         run: |
@@ -538,13 +533,12 @@ jobs:
             echo "::error::Could not find a compiled .config under kernel_workspace/out to verify"
             exit 1
           fi
-          echo "Checking $CFG"
           FAILED="false"
           for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS; do
             if grep -q "^${SYM}=y$" "$CFG"; then
               echo "✓ ${SYM}=y confirmed in final .config"
             else
-              echo "::error::${SYM} is NOT enabled in the final .config. Actual line:"
+              echo "::error::${SYM} is NOT enabled in the final .config."
               grep -n "${SYM}" "$CFG" || echo "(no ${SYM} line found at all)"
               FAILED="true"
             fi
@@ -570,7 +564,6 @@ jobs:
             echo "::error::No kernel Image found anywhere under kernel_workspace/out — build failed above"
             exit 1
           fi
-          echo "Found Image at: $IMG"
           echo "IMG_PATH=kernel_workspace/${IMG}" >> "$GITHUB_ENV"
 
       - name: Package AnyKernel3
