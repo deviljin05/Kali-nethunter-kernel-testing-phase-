@@ -1,11 +1,9 @@
 name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3 + RTL8XXXU + HID/CAN)
 # ============================================================================
-# Base = working sample (verbatim). Additions (pure additions, before
-# branding step):
-#  - USB HID gadget support    (toggle: enable_hid)
-#  - CAN bus support           (toggle: enable_can)
-#  - IIO / PCI endpoint configfs
-#  - RTL8XXXU Wi-Fi (=y built-in; AnyKernel3 only ships Image)
+# Base = working sample (verbatim) + 4 feature additions.
+# One minimal fix needed: KernelSU-Next upstream added a $(error ...) at
+# drivers/kernelsu/Kbuild:3 that fires during `make mrproper` (before
+# .config is loaded), aborting build.sh. Downgraded to $(warning ...).
 # ============================================================================
 
 on:
@@ -218,6 +216,36 @@ jobs:
             https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/kernelsu/patches/static.patch
           patch -p1 --forward < static.patch || echo "::warning::static.patch did not apply — may already be fixed upstream, not fatal"
 
+      # -----------------------------------------------------------------
+      # MINIMAL FIX: upstream KernelSU-Next now has $(error ...) at
+      # drivers/kernelsu/Kbuild:3 that fires during `make mrproper` before
+      # .config is loaded, aborting build.sh with:
+      #   *** "KernelSU requires either CONFIG_KPROBES=y or
+      #   CONFIG_KSU_SUSFS=y". Stop.
+      # Downgrade to $(warning ...) — the actual build has the configs set
+      # in gki_defconfig so the driver compiles fine.
+      # -----------------------------------------------------------------
+      - name: Relax KernelSU Kbuild check for mrproper phase
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          KB="drivers/kernelsu/Kbuild"
+          if [ ! -f "$KB" ]; then
+            echo "::warning::KernelSU Kbuild not found — skipping"
+            exit 0
+          fi
+          cp "$KB" "${KB}.orig"
+          sed -i 's|\$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")|$(warning "KernelSU: configs not visible during clean phase, non-fatal")|g' "$KB"
+          sed -i 's|error "KernelSU requires|warning "KernelSU requires|g' "$KB"
+          echo "--- Patched Kbuild head ---"
+          head -10 "$KB"
+          if grep -q 'error "KernelSU requires' "$KB"; then
+            echo "::warning::Patch incomplete:"
+            grep -n 'KernelSU requires' "$KB" || true
+          else
+            echo "✓ Kbuild $(error) -> $(warning) applied"
+          fi
+
       - name: Install Baseband Guard (BBG)
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         working-directory: kernel_workspace
@@ -389,7 +417,7 @@ jobs:
           } >> gki_defconfig
 
       # ===================================================================
-      # NAYE ADDITIONS — bas yeh 4 steps naye hain
+      # NAYE ADDITIONS
       # ===================================================================
 
       - name: Set full USB HID gadget configs
@@ -460,9 +488,6 @@ jobs:
       - name: Set USB Wi-Fi adapter driver configs (RTL8188/rtl8xxxu family)
         run: |
           cd kernel_workspace/common/arch/arm64/configs
-          # RTL8XXXU lives inside "if WLAN_VENDOR_REALTEK". GKI disables
-          # that gate by default; both set together below.
-          # =y (built-in), NOT =m — AnyKernel3 only ships Image.
           {
             echo "CONFIG_USB=y"
             echo "CONFIG_WLAN=y"
