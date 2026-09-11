@@ -1,4 +1,4 @@
-name: Build Custom GKI Kernel (KernelSU + SUSFS + BBRv3 + Full HID Support)
+name: Build Custom GKI Kernel (KernelSU-Next + SUSFS + BBRv3 + Full HID Support)
 
 on:
   workflow_dispatch:
@@ -12,9 +12,9 @@ on:
         required: false
         default: ""
       ksu_ref:
-        description: "KOWX712/KernelSU branch/tag/commit to check out (e.g. master, or a pinned release tag)"
+        description: "KernelSU-Next branch/tag/commit to check out (e.g. next, or a pinned release tag)"
         required: true
-        default: "master"
+        default: "next"
       device_name:
         description: "Optional label for artifact naming"
         required: false
@@ -196,24 +196,29 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      - name: Setup KernelSU
+      - name: Setup KernelSU-Next
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          curl -fsSL "https://raw.githubusercontent.com/KOWX712/KernelSU/master/kernel/setup.sh" | bash -s "${{ github.event.inputs.ksu_ref }}"
-          echo "KSU_COMMIT=$(git -C KernelSU rev-parse HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
+          curl -fsSL "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "${{ github.event.inputs.ksu_ref }}"
+          echo "KSU_COMMIT=$(git -C KernelSU-Next rev-parse HEAD 2>/dev/null || git -C KernelSU rev-parse HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
 
-      - name: Apply SUSFS patch to the KernelSU driver
-        working-directory: kernel_workspace/common/KernelSU
+      - name: Apply SUSFS patch to the KernelSU-Next driver
+        working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          cp ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./
+          KSU_DIR="KernelSU-Next"
+          [ -d "$KSU_DIR" ] || KSU_DIR="KernelSU"
+          cd "$KSU_DIR"
+          PATCH_SRC="../../susfs4ksu/kernel_patches/KernelSU-Next/10_enable_susfs_for_ksu.patch"
+          [ -f "$PATCH_SRC" ] || PATCH_SRC="../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+          cp "$PATCH_SRC" ./
           if grep -rq "CONFIG_KSU_SUSFS" . 2>/dev/null; then
-            echo "::notice::SUSFS hooks already present in KOWX712/KernelSU driver tree, skipping patch."
+            echo "::notice::SUSFS hooks already present in KernelSU-Next driver tree, skipping patch."
           elif patch -p1 --fuzz=3 --dry-run < 10_enable_susfs_for_ksu.patch >/dev/null 2>&1; then
             patch -p1 --fuzz=3 < 10_enable_susfs_for_ksu.patch
           else
-            echo "::warning::10_enable_susfs_for_ksu.patch did not apply cleanly against KOWX712/KernelSU -- continuing, but check CONFIG_KSU_SUSFS in 'Verify final configs' below."
+            echo "::warning::10_enable_susfs_for_ksu.patch did not apply cleanly against KernelSU-Next -- continuing, but check CONFIG_KSU_SUSFS in 'Verify final configs' below."
           fi
 
       - name: Install Baseband Guard
@@ -399,6 +404,15 @@ jobs:
             echo "CONFIG_PCI_ENDPOINT_CONFIGFS=y"
           } >> gki_defconfig
 
+      - name: Set USB Wi-Fi adapter driver configs (RTL8188/rtl8xxxu family)
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_CFG80211=y"
+            echo "CONFIG_MAC80211=y"
+            echo "CONFIG_RTL8XXXU=m"
+          } >> gki_defconfig
+
       - name: Apply custom kernel branding
         working-directory: kernel_workspace/common
         run: |
@@ -407,7 +421,7 @@ jobs:
           chmod +x scripts/setlocalversion.orig
           cat > scripts/setlocalversion << 'EOF'
           #!/bin/sh
-          printf -- '-BLAZE-KernelSU-STABLE'
+          printf -- '-BLAZE-KernelSUNext-STABLE'
 
           EOF
           chmod +x scripts/setlocalversion
@@ -466,6 +480,10 @@ jobs:
             fi
           done
 
+          if ! grep -qE "^CONFIG_RTL8XXXU=(y|m)$" "$CFG"; then
+            echo "::warning::CONFIG_RTL8XXXU did not end up enabled in the final .config (check Kconfig dependencies for CFG80211/MAC80211 on this GKI tree)."
+          fi
+
           if [ "${{ github.event.inputs.enable_hid }}" = "true" ]; then
             for SYM in CONFIG_USB_CONFIGFS_F_LB_SS CONFIG_USB_CONFIGFS_F_PRINTER CONFIG_USB_CONFIGFS_F_UAC1; do
               grep -q "^${SYM}=y$" "$CFG" || echo "::warning::${SYM} did not end up enabled in the final .config"
@@ -478,7 +496,7 @@ jobs:
 
           if [ "$FAIL" -eq 1 ]; then
             echo "----- Dumping full .config for debugging -----"
-            grep -E "CONFIG_(KSU|CAN|USB_CONFIGFS|NAMESPACES|NET_NS|PID_NS|CGROUPS|USER_NS)" "$CFG" || true
+            grep -E "CONFIG_(KSU|CAN|USB_CONFIGFS|NAMESPACES|NET_NS|PID_NS|CGROUPS|USER_NS|RTL8XXXU)" "$CFG" || true
             exit 1
           fi
 
@@ -499,7 +517,7 @@ jobs:
           git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 ak3
           cp "${{ env.IMG_PATH }}" ak3/Image
           cd ak3
-          zip -r9 -q "../${{ github.event.inputs.device_name }}-KernelSU-android12-5.10-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
+          zip -r9 -q "../${{ github.event.inputs.device_name }}-KernelSUNext-android12-5.10-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
