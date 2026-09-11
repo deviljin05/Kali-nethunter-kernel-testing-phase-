@@ -169,18 +169,31 @@ jobs:
             exit 1
           fi
 
-      # SUSFS's patch adds calls to susfs_* helpers (e.g. in fs/statfs.c) but does
-      # not always add the matching '#include <linux/susfs.h>' in every file it
-      # touches. Scan every file the patch modified and insert the include if a
-      # susfs_ symbol is used without it, instead of hardcoding one filename.
+      # FIX: The previous version of this step only scanned files listed as
+      # touched in the SUSFS patch's diff headers ('+++ b/path.c'). That regex
+      # relied on the diff header ending exactly in '.c' with nothing after it,
+      # which silently fails to match when the patch has trailing whitespace,
+      # a CRLF line ending, or a timestamp after the filename (common in
+      # non-git-format patches). fs/statfs.c was missed this way, which is
+      # exactly what caused the build failure:
+      #   fs/statfs.c:89:6: error: implicit declaration of function
+      #   'susfs_sus_kstat_spoof_vfs_statfs'
+      #
+      # Instead of depending on parsing the patch header at all, scan every
+      # .c file in the tree directly for susfs_* symbol usage. This is
+      # immune to patch-format quirks and also protects against any other
+      # file (now or in future SUSFS releases) that calls a susfs_ helper
+      # without including the header.
       - name: Ensure susfs.h is included wherever susfs_ symbols are used
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          TOUCHED_FILES="$(grep -oP '^\+\+\+ b/\K\S+\.c$' 50_add_susfs_in_gki-android12-5.10.patch | sort -u)"
-          for f in $TOUCHED_FILES; do
-            [ -f "$f" ] || continue
-            if grep -qE '\bsusfs_[a-zA-Z0-9_]+\s*\(' "$f" && ! grep -q '#include <linux/susfs.h>' "$f"; then
+          FILES_TO_FIX="$(grep -rlE '\bsusfs_[a-zA-Z0-9_]+\s*\(' --include='*.c' . | sort -u)"
+          if [ -z "${FILES_TO_FIX}" ]; then
+            echo "No files found calling susfs_* functions — nothing to do."
+          fi
+          for f in $FILES_TO_FIX; do
+            if ! grep -q '#include <linux/susfs.h>' "$f"; then
               echo "Adding missing #include <linux/susfs.h> to $f"
               LAST_INCLUDE_LINE="$(grep -n '^#include' "$f" | tail -1 | cut -d: -f1 || true)"
               if [ -n "${LAST_INCLUDE_LINE}" ]; then
@@ -188,6 +201,8 @@ jobs:
               else
                 sed -i "1i #include <linux/susfs.h>" "$f"
               fi
+            else
+              echo "✓ $f already includes linux/susfs.h"
             fi
           done
 
