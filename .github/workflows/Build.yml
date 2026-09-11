@@ -1,10 +1,22 @@
 name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3 + RTL8XXXU + HID/CAN)
 # ============================================================================
-# Base = working sample (verbatim) + 4 feature additions (HID, CAN, IIO/PCI,
-# RTL8XXXU) + 2 minimal fixes needed because the current upstream state of
-# BBG + KernelSU-Next dev-susfs trips two checks that didn't exist before:
-#   1) ld symlink (BBG's flask.h gen needs bare "ld" which AOSP clang lacks)
-#   2) KernelSU Kbuild $(error ...) fires during mrproper — patched to warning
+# Base = working sample (verbatim flow).
+# Additions (all as pure additions right before branding step):
+#  - USB HID gadget support    (toggle: enable_hid)
+#  - CAN bus support           (toggle: enable_can)
+#  - IIO / PCI endpoint configfs
+#  - RTL8XXXU Wi-Fi (=y built-in; AnyKernel3 only ships Image, =m useless)
+#
+# Three fixes required because current upstream BBG + KernelSU-Next
+# dev-susfs trips checks that didn't exist when the sample was last green:
+#  A) ld symlink        -> BBG flask.h gen needs bare "ld" (AOSP clang
+#                          only ships ld.lld)
+#  B) Kbuild $(error)   -> "KernelSU requires either CONFIG_KPROBES=y or
+#                          CONFIG_KSU_SUSFS=y" fires during mrproper when
+#                          .config isn't loaded yet; downgrade to $(warning)
+#  C) KMI/ABI relax     -> our additions export non-reference symbols;
+#                          strict KMI aborts at final link with bare
+#                          "make: *** Error 2" and no visible cause
 # ============================================================================
 
 on:
@@ -119,11 +131,10 @@ jobs:
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
       # -----------------------------------------------------------------
-      # FIX 1: clang-12: error: unable to execute command: Executable "ld"
-      # doesn't exist!  -- AOSP clang prebuilts ship ld.lld but not a bare
-      # "ld".  BBG's flask.h regeneration invokes host "ld" directly.
+      # FIX A: clang-12 "Executable ld doesn't exist" — AOSP clang ships
+      # ld.lld but BBG's flask.h regeneration invokes bare "ld".
       # -----------------------------------------------------------------
-      - name: Symlink ld -> ld.lld in clang prebuilts
+      - name: Fix A — symlink ld -> ld.lld in clang prebuilts
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
@@ -206,7 +217,12 @@ jobs:
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' fs/namei.c
+          if grep -q 'set_nameidata(nd, old_dfd, fake_filename, NULL);' fs/namei.c; then
+            sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' fs/namei.c
+            echo "Applied 4-arg -> 3-arg set_nameidata fix"
+          else
+            echo "4-arg set_nameidata not found — skipping (already correct form)"
+          fi
 
       - name: Revert android12-5.10 pre-patch compatibility fixes
         working-directory: kernel_workspace/common
@@ -243,22 +259,17 @@ jobs:
           patch -p1 --forward < static.patch || echo "::warning::static.patch did not apply — may already be fixed upstream, not fatal"
 
       # -----------------------------------------------------------------
-      # FIX 2: drivers/kernelsu/Kbuild:3: *** "KernelSU requires either
-      # CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y". Stop.
-      # -- This $(error ...) fires during `make mrproper` (invoked by
-      # build.sh before the build proper). At that moment .config isn't
-      # loaded, so BOTH CONFIG_KSU_SUSFS and CONFIG_KPROBES are empty and
-      # the check trips even on a correctly-configured tree. The check is
-      # only meaningful during an actual kernel build. Replace the fatal
-      # error with a non-fatal warning so mrproper completes cleanly.
+      # FIX B: mrproper-time KernelSU Kbuild $(error) -> $(warning).
+      # The check fires before .config is loaded, so KPROBES/KSU_SUSFS
+      # are both empty even on a correctly-configured tree.
       # -----------------------------------------------------------------
-      - name: Patch KernelSU Kbuild to tolerate mrproper phase
+      - name: Fix B — relax KernelSU Kbuild check for mrproper phase
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           KB="drivers/kernelsu/Kbuild"
           if [ ! -f "$KB" ]; then
-            echo "::warning::KernelSU Kbuild not found at $KB — skipping patch"
+            echo "::warning::KernelSU Kbuild not found at $KB — skipping"
             exit 0
           fi
           if grep -q "BLAZE_KBUILD_PATCHED" "$KB"; then
@@ -266,20 +277,13 @@ jobs:
             exit 0
           fi
           cp "$KB" "${KB}.orig"
-          # Replace the $(error "KernelSU requires either CONFIG_KPROBES=y
-          # or CONFIG_KSU_SUSFS=y") line with a $(warning ...) so mrproper
-          # doesn't abort.  Actual build still has the configs set via
-          # gki_defconfig, so the module builds correctly.
           sed -i 's|\$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")|$(warning "KernelSU: configs not visible (likely mrproper/clean phase, non-fatal)")|g' "$KB"
-          # Belt and braces: also handle variants with different quoting.
           sed -i 's|error "KernelSU requires|warning "KernelSU requires|g' "$KB"
-          # Marker for idempotency
           sed -i '1i # BLAZE_KBUILD_PATCHED: $(error ...) -> $(warning ...) for mrproper compat' "$KB"
           echo "--- Patched Kbuild head ---"
           head -15 "$KB"
-          echo "--- check ---"
           if grep -q 'error "KernelSU requires' "$KB"; then
-            echo "::warning::Patch may not have caught all instances — checking:"
+            echo "::warning::Patch may not have caught all instances:"
             grep -n 'KernelSU requires' "$KB" || true
           else
             echo "✓ Kbuild error -> warning patch applied"
@@ -348,6 +352,7 @@ jobs:
           else
             echo "::warning::BBRv3 patch not found at expected path"
           fi
+          [ -z "$BBR_CONG_NAME" ] && BBR_CONG_NAME="bbr"
           echo "Detected default TCP congestion control name: ${BBR_CONG_NAME}"
           echo "BBRv3 patch applied: ${BBRV3_PATCH_APPLIED}"
           echo "BBR_CONG_NAME=${BBR_CONG_NAME}" >> "$GITHUB_ENV"
@@ -391,11 +396,11 @@ jobs:
 
           curl -LSs -o /tmp/ntsync_compat_android12-5.10.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_compat_android12-5.10.patch
-          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || echo "::warning::ntsync compat patch had rejects — check .rej"
+          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || { echo "::warning::ntsync compat patch had rejects:"; find . -name "*.rej"; }
 
           curl -LSs -o /tmp/ntsync_base.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_base.patch
-          patch -p1 < /tmp/ntsync_base.patch || echo "::warning::ntsync base patch had rejects — check .rej"
+          patch -p1 < /tmp/ntsync_base.patch || { echo "::warning::ntsync base patch had rejects:"; find . -name "*.rej"; }
 
           echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
 
@@ -555,14 +560,54 @@ jobs:
           SETLOCALVERSION_EOF
           chmod +x scripts/setlocalversion
 
-      - name: Disable strict defconfig verification
-        working-directory: kernel_workspace
-        run: sed -i 's/check_defconfig//' ./common/build.config.gki
-
-      - name: Build kernel
+      # -----------------------------------------------------------------
+      # FIX C: disable strict defconfig verification AND KMI/ABI
+      # enforcement. Our additions (RTL8XXXU, CAN, HID, IIO/PCI, BBG,
+      # SUSFS, NTSync) export symbols not present in abi_gki_aarch64_*
+      # reference lists. With strict KMI on, build aborts at the final
+      # link/ABI stage with a bare "make: *** Error 2" and no visible
+      # cause in the log tail.
+      # -----------------------------------------------------------------
+      - name: Fix C — disable strict defconfig + KMI/ABI enforcement
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
+          # check_defconfig: allow our gki_defconfig edits
+          sed -i 's/check_defconfig//' ./common/build.config.gki
+
+          # KMI strict mode / ABI enforcement
+          for cfg in common/build.config.gki.aarch64 common/build.config.gki; do
+            [ -f "$cfg" ] || continue
+            sed -i -E 's/^(KMI_SYMBOL_LIST_STRICT_MODE=).*/\10/' "$cfg"
+            sed -i -E 's/^(KMI_ENFORCED=).*/\10/' "$cfg"
+            sed -i -E 's/^(TRIM_NONLISTED_KMI=).*/\10/' "$cfg"
+            echo "--- $cfg after edit ---"
+            grep -E '^(KMI_|TRIM_|MODULES_ORDER)' "$cfg" || true
+          done
+
+          # Belt-and-braces: also blank them in any fragment files that
+          # could re-assert them with ${VAR:-1} defaults.
+          find common -maxdepth 2 -name 'build.config*' -type f | while read -r f; do
+            sed -i -E 's/^(KMI_SYMBOL_LIST_STRICT_MODE=).*/\10/' "$f" 2>/dev/null || true
+            sed -i -E 's/^(KMI_ENFORCED=).*/\10/' "$f" 2>/dev/null || true
+            sed -i -E 's/^(TRIM_NONLISTED_KMI=).*/\10/' "$f" 2>/dev/null || true
+          done
+
+      - name: Build kernel
+        working-directory: kernel_workspace
+        env:
+          # Override the ${VAR:-1} defaults the log showed being used, so
+          # even a fragment that re-asserts them will see our value.
+          KMI_SYMBOL_LIST_STRICT_MODE: "0"
+          KMI_ENFORCED: "0"
+          TRIM_NONLISTED_KMI: "0"
+        run: |
+          set -euo pipefail
+          # Prepend the freshly-symlinked clang bin so host-tool "ld" resolves
+          CLANG_BIN="$(find prebuilts-master/clang -type d -name bin 2>/dev/null | head -n1 || true)"
+          if [ -n "$CLANG_BIN" ]; then
+            export PATH="${CLANG_BIN}:${PATH}"
+          fi
           export KBUILD_BUILD_USER="builder"
           export KBUILD_BUILD_HOST="ci"
           LTO=thin \
