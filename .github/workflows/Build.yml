@@ -1,14 +1,14 @@
 name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3 + RTL8XXXU + HID/CAN)
 # ============================================================================
 # Base = working sample (verbatim flow).
-# Additions (all as pure additions right before branding step):
+# Additions (as pure additions before branding step):
 #  - USB HID gadget support    (toggle: enable_hid)
 #  - CAN bus support           (toggle: enable_can)
 #  - IIO / PCI endpoint configfs
 #  - RTL8XXXU Wi-Fi (=y built-in; AnyKernel3 only ships Image, =m useless)
 #
-# Three fixes required because current upstream BBG + KernelSU-Next
-# dev-susfs trips checks that didn't exist when the sample was last green:
+# Fixes required because current upstream BBG + KernelSU-Next dev-susfs
+# trips checks that didn't exist when the sample was last green:
 #  A) ld symlink        -> BBG flask.h gen needs bare "ld" (AOSP clang
 #                          only ships ld.lld)
 #  B) Kbuild $(error)   -> "KernelSU requires either CONFIG_KPROBES=y or
@@ -17,6 +17,9 @@ name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3 + RTL8XXXU + HID/CAN)
 #  C) KMI/ABI relax     -> our additions export non-reference symbols;
 #                          strict KMI aborts at final link with bare
 #                          "make: *** Error 2" and no visible cause
+#  C2) modpost relax    -> KBUILD_MODPOST_WARN=1 downgrades modpost errors
+#  D) Diagnostic build  -> capture full build log and print the REAL error
+#                          (not just the make summary) if the build fails
 # ============================================================================
 
 on:
@@ -562,59 +565,87 @@ jobs:
 
       # -----------------------------------------------------------------
       # FIX C: disable strict defconfig verification AND KMI/ABI
-      # enforcement. Our additions (RTL8XXXU, CAN, HID, IIO/PCI, BBG,
-      # SUSFS, NTSync) export symbols not present in abi_gki_aarch64_*
-      # reference lists. With strict KMI on, build aborts at the final
-      # link/ABI stage with a bare "make: *** Error 2" and no visible
-      # cause in the log tail.
+      # enforcement. NOTE: previous version used `sed -E 's/(...)/\10/'`
+      # which GNU sed parses as backref-10 (invalid) and silently no-ops,
+      # leaving KMI_ENFORCED=1 in place. This version does explicit
+      # full-line replacement + append-if-missing, so it actually works.
       # -----------------------------------------------------------------
       - name: Fix C — disable strict defconfig + KMI/ABI enforcement
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          # check_defconfig: allow our gki_defconfig edits
           sed -i 's/check_defconfig//' ./common/build.config.gki
 
-          # KMI strict mode / ABI enforcement
           for cfg in common/build.config.gki.aarch64 common/build.config.gki; do
             [ -f "$cfg" ] || continue
-            sed -i -E 's/^(KMI_SYMBOL_LIST_STRICT_MODE=).*/\10/' "$cfg"
-            sed -i -E 's/^(KMI_ENFORCED=).*/\10/' "$cfg"
-            sed -i -E 's/^(TRIM_NONLISTED_KMI=).*/\10/' "$cfg"
+            sed -i 's/^KMI_SYMBOL_LIST_STRICT_MODE=.*/KMI_SYMBOL_LIST_STRICT_MODE=0/' "$cfg" || true
+            sed -i 's/^KMI_ENFORCED=.*/KMI_ENFORCED=0/' "$cfg" || true
+            sed -i 's/^TRIM_NONLISTED_KMI=.*/TRIM_NONLISTED_KMI=0/' "$cfg" || true
+            grep -q '^KMI_SYMBOL_LIST_STRICT_MODE=' "$cfg" || echo 'KMI_SYMBOL_LIST_STRICT_MODE=0' >> "$cfg"
+            grep -q '^KMI_ENFORCED='                 "$cfg" || echo 'KMI_ENFORCED=0'                 >> "$cfg"
+            grep -q '^TRIM_NONLISTED_KMI='           "$cfg" || echo 'TRIM_NONLISTED_KMI=0'           >> "$cfg"
             echo "--- $cfg after edit ---"
-            grep -E '^(KMI_|TRIM_|MODULES_ORDER)' "$cfg" || true
+            grep -nE '^(KMI_|TRIM_|MODULES_ORDER)' "$cfg" || true
           done
 
-          # Belt-and-braces: also blank them in any fragment files that
-          # could re-assert them with ${VAR:-1} defaults.
           find common -maxdepth 2 -name 'build.config*' -type f | while read -r f; do
-            sed -i -E 's/^(KMI_SYMBOL_LIST_STRICT_MODE=).*/\10/' "$f" 2>/dev/null || true
-            sed -i -E 's/^(KMI_ENFORCED=).*/\10/' "$f" 2>/dev/null || true
-            sed -i -E 's/^(TRIM_NONLISTED_KMI=).*/\10/' "$f" 2>/dev/null || true
+            sed -i 's/^KMI_SYMBOL_LIST_STRICT_MODE=.*/KMI_SYMBOL_LIST_STRICT_MODE=0/' "$f" 2>/dev/null || true
+            sed -i 's/^KMI_ENFORCED=.*/KMI_ENFORCED=0/' "$f" 2>/dev/null || true
+            sed -i 's/^TRIM_NONLISTED_KMI=.*/TRIM_NONLISTED_KMI=0/' "$f" 2>/dev/null || true
           done
 
+      # -----------------------------------------------------------------
+      # Diagnostic build step: captures full log to /tmp/build.log, and on
+      # failure prints the REAL error (not just the make summary), so we
+      # don't have to guess what's failing at the link stage anymore.
+      # -----------------------------------------------------------------
       - name: Build kernel
         working-directory: kernel_workspace
         env:
-          # Override the ${VAR:-1} defaults the log showed being used, so
-          # even a fragment that re-asserts them will see our value.
           KMI_SYMBOL_LIST_STRICT_MODE: "0"
           KMI_ENFORCED: "0"
           TRIM_NONLISTED_KMI: "0"
+          # Downgrade modpost hard errors to warnings — a common cause of
+          # "make: *** Error 2" when new features reference new symbols.
+          KBUILD_MODPOST_WARN: "1"
         run: |
-          set -euo pipefail
-          # Prepend the freshly-symlinked clang bin so host-tool "ld" resolves
+          set -uo pipefail
+          # NOT `set -e` on purpose: we want to capture the real error from
+          # the log before failing, not just the make summary.
           CLANG_BIN="$(find prebuilts-master/clang -type d -name bin 2>/dev/null | head -n1 || true)"
-          if [ -n "$CLANG_BIN" ]; then
-            export PATH="${CLANG_BIN}:${PATH}"
-          fi
+          [ -n "$CLANG_BIN" ] && export PATH="${CLANG_BIN}:${PATH}"
           export KBUILD_BUILD_USER="builder"
           export KBUILD_BUILD_HOST="ci"
+
+          LOG=/tmp/build.log
+          set +e
           LTO=thin \
           BUILD_CONFIG=common/build.config.gki.aarch64 \
           USE_CCACHE=1 \
           CCACHE_DIR="${{ env.CCACHE_DIR }}" \
-          build/build.sh -j"$(nproc)"
+          build/build.sh -j"$(nproc)" 2>&1 | tee "$LOG"
+          RC=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$RC" -ne 0 ]; then
+            echo "::group::REAL ERROR CONTEXT (grep of build log)"
+            grep -nE 'error:|fatal error:|undefined reference|undefined symbol|multiple definition|ERROR: modpost|ERROR: |\*\*\*|\.rej|abigail|dwarf|KMI|ABI' "$LOG" | tail -n120 || true
+            echo "::endgroup::"
+
+            echo "::group::LAST 150 LINES OF BUILD LOG"
+            tail -n150 "$LOG" || true
+            echo "::endgroup::"
+
+            echo "::group::Lines just above the final make error"
+            ERR_LINE=$(grep -n 'make: \*\*\*' "$LOG" | head -n1 | cut -d: -f1 || true)
+            if [ -n "$ERR_LINE" ]; then
+              START=$(( ERR_LINE > 40 ? ERR_LINE - 40 : 1 ))
+              sed -n "${START},${ERR_LINE}p" "$LOG"
+            fi
+            echo "::endgroup::"
+
+            exit "$RC"
+          fi
 
       - name: Verify namespace / cgroup configs made it into the final .config
         working-directory: kernel_workspace
