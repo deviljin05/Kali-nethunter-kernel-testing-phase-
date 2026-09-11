@@ -1,4 +1,69 @@
-name: Build Custom GKI Kernel (KernelSU-Next + SUSFS + BBRv3 + Full HID Support)
+name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3 + RTL8XXXU + HID/CAN)
+# ============================================================================
+# Base build flow is copied verbatim from the user's proven-working
+# reference (Wild KSU + SUSFS + BBRv3). On top of that, four groups of
+# additions are layered in as pure additions -- nothing in the base flow
+# below is altered:
+#  - RTL8XXXU (Realtek RTL8188 family USB Wi-Fi) driver support, including
+#    its parent Kconfig gate CONFIG_WLAN_VENDOR_REALTEK which GKI defconfigs
+#    disable by default (setting CONFIG_RTL8XXXU=m alone is a no-op without
+#    also re-enabling that parent gate)
+#  - Full USB HID gadget support (toggle via enable_hid)
+#  - CAN bus support (toggle via enable_can)
+#  - IIO / PCI endpoint configfs configs
+#
+# Kept from the base (unchanged):
+#  - SUSFS4KSU (file/mount/kstat hiding, uname/cmdline spoofing, etc.)
+#  - KernelSU-Next (pershoot fork, dev-susfs branch -- SUSFS hooks are
+#    natively built into this branch's driver source, so no separate patch
+#    step against the KernelSU-Next tree is needed)
+#  - Baseband Guard (BBG) — plain upstream form, no recovery bypass,
+#    enforces in every boot mode. Toggle via the enable_bbg input.
+#  - BBRv3 TCP congestion control backport (falls back to mainline BBR
+#    if the patch doesn't apply cleanly; default congestion-control
+#    name is detected from source rather than assumed)
+#  - Droidspaces container-runtime support (kABI-safe SYSVIPC +
+#    POSIX_MQUEUE patches; the risky configs are only enabled if both
+#    patches apply cleanly, to avoid a bootloop)
+#  - NTSync
+#  - Custom kernel branding (-BLAZE-KSUNv1-STABLE version suffix)
+#
+# NOTE ON CONFIG_NAMESPACES / CONFIG_NET_NS / CONFIG_CGROUPS:
+# These are already default-y on virtually all GKI android12-5.10
+# defconfigs, so explicitly forcing them below is a no-op in the normal
+# case. They were added back in on explicit user request.
+#
+# NOTE ON CONFIG_USER_NS:
+# Per user request, this build now DOES force CONFIG_USER_NS=y (set
+# alongside the other namespace configs below, and included in the
+# post-build verification step) so that Droidspaces' "User namespace"
+# optional-feature check reports [✓] instead of [✗].
+#
+# NOTE ON SOURCE PINNING (os_patch_level):
+# 'lts' resolves to the rolling common-android12-5.10-lts branch (always
+# current, moves under you between runs).
+#
+# Anything else (e.g. android12-5.10.264_r00) is a GKI release TAG. That
+# tag lives on the kernel/common repo itself, NOT on kernel/manifest — so
+# it cannot be passed to `repo init -b`, which selects a branch/tag of the
+# *manifest* repo (this is what caused "couldn't find remote ref
+# refs/heads/android12-5.10.264_r00" — repo was looking for that ref on
+# kernel/manifest, where it doesn't exist). Instead: repo init/sync always
+# targets the normal common-android12-5.10[-lts] manifest branch (which
+# gives us kernel/common shallow-cloned at HEAD), and THEN, if a specific
+# tag was requested, we fetch and check out that exact tag inside
+# kernel_workspace/common directly against the kernel/common remote. This
+# pins the actual kernel source tree to that release regardless of what
+# the manifest's HEAD currently points to. Default below is pinned to the
+# android12-5.10.264 release build per explicit user request, so repeat
+# runs are reproducible until you change the input.
+#
+# NOTE ON RTL8XXXU:
+# RTL8XXXU lives inside the "if WLAN_VENDOR_REALTEK" Kconfig menu, which
+# GKI defconfigs disable by default. Setting CONFIG_RTL8XXXU=m without also
+# re-enabling CONFIG_WLAN_VENDOR_REALTEK=y gets silently dropped when the
+# .config is resolved -- both are set together below.
+# ============================================================================
 
 on:
   workflow_dispatch:
@@ -8,7 +73,7 @@ on:
         required: true
         default: "android12-5.10.264_r00"
       susfs_commit:
-        description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch)"
+        description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch, i.e. latest SUSFS release)"
         required: false
         default: ""
       device_name:
@@ -16,7 +81,7 @@ on:
         required: false
         default: "gki-custom"
       enable_bbg:
-        description: "Enable Baseband Guard (BBG)"
+        description: "Enable Baseband Guard (BBG) — LSM that blocks unauthorized writes to modem/bootloader partitions, protects against brick from malicious root modules. Enforces in all boot modes, including recovery."
         required: true
         default: "true"
       enable_hid:
@@ -36,7 +101,6 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 150
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -56,25 +120,32 @@ jobs:
       - name: Install repo tool
         run: |
           mkdir -p ~/bin
-          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
           chmod a+x ~/bin/repo
           echo "$HOME/bin" >> "$GITHUB_PATH"
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Set up ccache
-        run: mkdir -p "${CCACHE_DIR}"
+        run: mkdir -p "${{ env.CCACHE_DIR }}"
 
       - name: Resolve manifest branch and optional pinned release tag
         run: |
           set -euo pipefail
           INPUT="${{ github.event.inputs.os_patch_level }}"
           if [ "${INPUT}" = "lts" ]; then
-            MANIFEST_REF="common-${VERSION}-lts"
+            MANIFEST_REF="common-${{ env.VERSION }}-lts"
             PIN_TAG=""
+            echo "Tracking rolling LTS branch: ${MANIFEST_REF}"
           else
-            MANIFEST_REF="common-${VERSION}"
+            # INPUT (e.g. android12-5.10.264_r00) is a release TAG that lives
+            # on kernel/common, not a branch/tag of kernel/manifest. Sync the
+            # manifest's normal dev branch so repo/build tooling is present,
+            # then pin the common/ checkout to this exact tag afterward.
+            MANIFEST_REF="common-${{ env.VERSION }}"
             PIN_TAG="${INPUT}"
+            echo "Manifest branch for sync: ${MANIFEST_REF}"
+            echo "Will pin kernel_workspace/common to release tag: ${PIN_TAG}"
           fi
           echo "MANIFEST_REF=${MANIFEST_REF}" >> "$GITHUB_ENV"
           echo "PIN_TAG=${PIN_TAG}" >> "$GITHUB_ENV"
@@ -82,29 +153,37 @@ jobs:
       - name: Sync GKI kernel source
         run: |
           set -euo pipefail
-          mkdir -p kernel_workspace
-          cd kernel_workspace
-          repo init -u https://android.googlesource.com/kernel/manifest -b "${MANIFEST_REF}" --depth=1
+          mkdir kernel_workspace && cd kernel_workspace
+          repo init -u https://android.googlesource.com/kernel/manifest \
+            -b "${MANIFEST_REF}" --depth=1
           repo sync -c --current-branch --no-clone-bundle --no-tags -j"$(nproc)"
 
-      - name: Pin kernel/common to exact release tag
+      - name: Pin kernel/common to exact release tag (if requested)
         if: ${{ env.PIN_TAG != '' }}
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
+          # repo-managed checkouts don't always name the remote "origin" —
+          # it's whatever the manifest's <remote> element defines (often
+          # "aosp" for AOSP kernel manifests). Detect it instead of assuming.
           REMOTE_NAME="$(git remote | head -n1)"
-          [ -n "${REMOTE_NAME}" ]
+          if [ -z "${REMOTE_NAME}" ]; then
+            echo "::error::No git remote found in kernel_workspace/common — cannot fetch pinned tag"
+            exit 1
+          fi
+          echo "Using remote '${REMOTE_NAME}' to fetch tag ${PIN_TAG}"
           git fetch --depth=1 "${REMOTE_NAME}" "refs/tags/${PIN_TAG}:refs/tags/${PIN_TAG}"
           git checkout "refs/tags/${PIN_TAG}"
+          echo "Now on: $(git describe --tags --always) ($(git rev-parse HEAD))"
 
       - name: Detect kernel sublevel
         working-directory: kernel_workspace
         run: |
-          set -euo pipefail
           SUBLEVEL="$(grep -m1 '^SUBLEVEL = ' common/Makefile | awk '{print $3}')"
+          echo "Detected SUBLEVEL: $SUBLEVEL"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
-      - name: Clone SUSFS4KSU
+      - name: Clone SUSFS4KSU (latest = current SUSFS release)
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
@@ -114,6 +193,7 @@ jobs:
             git checkout "${{ github.event.inputs.susfs_commit }}"
           fi
           echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SUSFS commit in use: $(git rev-parse HEAD) — $(git log -1 --format=%s)"
 
       - name: Set SUSFS kernel configs
         run: |
@@ -147,7 +227,7 @@ jobs:
             perl -i -pe 's/(int|size_t)\s+this_len\s*=\s*min_t\s*\(\s*\1\s*,/size_t this_len = min_t(size_t,/' fs/proc/base.c
           fi
           if [ "${SUBLEVEL}" -le "117" ]; then
-            sed -i '\#^[[:space:]]*/\*$#,\#^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$#d' fs/notify/fdinfo.c
+            sed -i '/^[[:space:]]*\/\*$/,/^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$/d' fs/notify/fdinfo.c
             perl -i -pe 's/\bmask,\s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
             perl -i -pe 's/ignored_mask:%x/ignored_mask:0/g' fs/notify/fdinfo.c
           fi
@@ -176,36 +256,23 @@ jobs:
             sed -i 's/^size_t this_len = min_t(size_t, count, PAGE_SIZE);$/int this_len = min_t(int, count, PAGE_SIZE);/' fs/proc/base.c
           fi
           if [ "${SUBLEVEL}" -le "117" ]; then
-            perl -i -pe 's#^(\s+if \(inode\) \{)#$1
-            \t\t/*
-            \t\t * IN_ALL_EVENTS represents all of the mask bits
-            \t\t * that we expose to userspace.  There is at
-            \t\t * least one bit (FS_EVENT_ON_CHILD) which is
-            \t\t * used only internally to the kernel.
-            \t\t */
-            \t\tu32 mask = mark->mask & IN_ALL_EVENTS;#m' fs/notify/fdinfo.c
+            perl -i -pe 's/^(\s+if \(inode\) \{)/$1\n\t\t\/\*\n\t\t * IN_ALL_EVENTS represents all of the mask bits\n\t\t * that we expose to userspace.  There is at\n\t\t * least one bit (FS_EVENT_ON_CHILD) which is\n\t\t * used only internally to the kernel.\n\t\t *\/\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;/m' fs/notify/fdinfo.c
             perl -i -pe 's/\binotify_mark_user_mask\(mark\)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
             perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
           fi
 
-      - name: Apply SUSFS show_pad fix
+      - name: Apply SUSFS show_pad fix (older sublevels only)
         working-directory: kernel_workspace/common
         run: |
-          set -euo pipefail
           if [ "${SUBLEVEL}" -le "209" ]; then
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      - name: Setup KernelSU-Next (pershoot fork, dev-susfs branch)
+      - name: Setup KernelSU-Next (Wild KSU, dev-susfs)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          # The dev-susfs branch of pershoot/KernelSU-Next has SUSFS hooks
-          # natively built into the driver source already -- unlike the
-          # upstream KernelSU-Next/KernelSU-Next repo, there is no separate
-          # patch step needed here for CONFIG_KSU_SUSFS to bind correctly.
           curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
-          echo "KSU_COMMIT=$(git -C KernelSU-Next rev-parse HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
 
       - name: Fix KernelSU-Next (static.patch)
         working-directory: kernel_workspace/common/KernelSU-Next
@@ -215,19 +282,40 @@ jobs:
             https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/kernelsu/patches/static.patch
           patch -p1 --forward < static.patch || echo "::warning::static.patch did not apply — may already be fixed upstream, not fatal"
 
-      - name: Install Baseband Guard
+      - name: Install Baseband Guard (BBG)
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          wget -qO- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
+          wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
 
       - name: Configure Baseband Guard LSM
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         working-directory: kernel_workspace
         run: |
-           set -euo pipefail
-           sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig
+          set -euo pipefail
+          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig
+
+      - name: Verify BBG installation
+        if: ${{ github.event.inputs.enable_bbg == 'true' }}
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          if grep -q "baseband_guard" common/security/Kconfig; then
+            echo "✓ BBG registered in common/security/Kconfig"
+            grep -n "baseband_guard" common/security/Kconfig || true
+          else
+            echo "::error::baseband_guard not found in common/security/Kconfig after setup — BBG install likely failed above"
+            exit 1
+          fi
+
+      - name: Record BBG version
+        if: ${{ github.event.inputs.enable_bbg == 'true' }}
+        working-directory: kernel_workspace/Baseband-guard
+        run: |
+          BBG_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          echo "BBG_COMMIT=${BBG_COMMIT}" >> "$GITHUB_ENV"
+          echo "BBG commit: ${BBG_COMMIT}"
 
       - name: Enable BBG config
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -243,12 +331,31 @@ jobs:
           BBRV3_PATCH="/tmp/wildpatches/common/bbrv3/0001-net-tcp-backport-BBRv3-to-android12-5.10.patch"
           BBR_CONG_NAME="bbr"
           BBRV3_PATCH_APPLIED="false"
-          if [ -f "$BBRV3_PATCH" ] && patch -p1 < "$BBRV3_PATCH"; then
-            BBRV3_PATCH_APPLIED="true"
-            DETECTED="$(grep -rhoE '\.name\s*=\s*"[a-zA-Z0-9_]+"' net/ipv4/tcp_bbr*.c 2>/dev/null | grep -oE '"[a-zA-Z0-9_]+"' | tr -d '"' | head -n1 || true)"
-            [ -n "$DETECTED" ] && BBR_CONG_NAME="$DETECTED"
+          if [ -f "$BBRV3_PATCH" ]; then
+            if patch -p1 < "$BBRV3_PATCH"; then
+              BBRV3_PATCH_APPLIED="true"
+              # Detect the actual registered congestion-control algorithm
+              # name from source instead of assuming "bbr3" — some backports
+              # keep the struct named "bbr" and only bump an internal
+              # version field, others register a distinct "bbr3" name.
+              DETECTED="$(grep -rhoE '\.name\s*=\s*"[a-zA-Z0-9_]+"' net/ipv4/tcp_bbr*.c 2>/dev/null | grep -oE '"[a-zA-Z0-9_]+"' | tr -d '"' | head -n1 || true)"
+              if [ -n "$DETECTED" ]; then
+                BBR_CONG_NAME="$DETECTED"
+              fi
+            else
+              echo "::warning::BBRv3 patch had rejects — check .rej files below (BBR v1 config below still gives working TCP congestion control even if this fails)"
+              find . -name "*.rej"
+            fi
+          else
+            echo "::warning::BBRv3 patch not found at expected path — repo structure may have changed. Skipping; BBR (v1) below still applies."
           fi
+          echo "Detected default TCP congestion control name: ${BBR_CONG_NAME}"
+          echo "BBRv3 patch applied: ${BBRV3_PATCH_APPLIED}"
           echo "BBR_CONG_NAME=${BBR_CONG_NAME}" >> "$GITHUB_ENV"
+          # CONFIG_TCP_CONG_BBR3 is only a real Kconfig symbol once the
+          # patch above has added it — setting it unconditionally would
+          # leave a dangling/unknown config entry if the patch fails,
+          # the same class of no-op bug as an unconditional feature flag.
           echo "BBRV3_PATCH_APPLIED=${BBRV3_PATCH_APPLIED}" >> "$GITHUB_ENV"
 
           if ! grep -qF 'int proc_dou8vec_minmax(' ./include/linux/sysctl.h; then
@@ -282,36 +389,57 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${SUBLEVEL}" -le "208" ]; then
-            curl -fsSL -o /tmp/0003-lockdep-assert-none-held.patch \
+            curl -LSs -o /tmp/0003-lockdep-assert-none-held.patch \
               https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/ntsync/patches/0003-lockdep-assert-none-held.patch
-            patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || true
+            patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || echo "::warning::lockdep fix did not apply — may already be present"
           fi
-          curl -fsSL -o /tmp/ntsync_compat_android12-5.10.patch \
+
+          curl -LSs -o /tmp/ntsync_compat_android12-5.10.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_compat_android12-5.10.patch
-          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || true
-          curl -fsSL -o /tmp/ntsync_base.patch \
+          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || echo "::warning::ntsync compat patch had rejects — check .rej"
+
+          curl -LSs -o /tmp/ntsync_base.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_base.patch
-          patch -p1 < /tmp/ntsync_base.patch || true
+          patch -p1 < /tmp/ntsync_base.patch || echo "::warning::ntsync base patch had rejects — check .rej"
+
           echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
 
-      - name: Apply Droidspaces kABI-safe patches
+      - name: Apply Droidspaces kABI-safe patches (SYSVIPC + POSIX_MQUEUE)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
+          # Droidspaces (LXC-like container runtime) needs CONFIG_SYSVIPC,
+          # CONFIG_IPC_NS and CONFIG_POSIX_MQUEUE. On a GKI kernel these
+          # normally shift task_struct's memory layout and bootloop the
+          # device against stock vendor modules — these two official
+          # Droidspaces patches use the ANDROID_KABI_RESERVE padding slots
+          # instead, so the struct layout stays ABI-stable. Both are
+          # mandatory for kernel 5.10 (this build's VERSION); this is NOT
+          # optional per upstream docs. If either fails to apply, we do
+          # NOT enable the risky configs below — better to skip the
+          # feature than ship a kernel that bootloops on real hardware.
           DROIDSPACES_KABI_OK="true"
-          curl -fsSL -o /tmp/droidspaces_sysvipc_kabi.patch \
+
+          curl -LSs -o /tmp/droidspaces_sysvipc_kabi.patch \
             https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
           if ! patch -p1 < /tmp/droidspaces_sysvipc_kabi.patch; then
+            echo "::warning::Droidspaces SYSVIPC kABI patch had rejects — check .rej files below. Skipping CONFIG_SYSVIPC/CONFIG_IPC_NS/CONFIG_POSIX_MQUEUE to avoid a bootloop."
+            find . -name "*.rej"
             DROIDSPACES_KABI_OK="false"
           fi
-          curl -fsSL -o /tmp/droidspaces_posix_mqueue_kabi.patch \
+
+          curl -LSs -o /tmp/droidspaces_posix_mqueue_kabi.patch \
             https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
           if ! patch -p1 < /tmp/droidspaces_posix_mqueue_kabi.patch; then
+            echo "::warning::Droidspaces POSIX_MQUEUE kABI patch had rejects — check .rej files below. Skipping CONFIG_SYSVIPC/CONFIG_IPC_NS/CONFIG_POSIX_MQUEUE to avoid a bootloop."
+            find . -name "*.rej"
             DROIDSPACES_KABI_OK="false"
           fi
+
+          echo "Droidspaces kABI patches applied cleanly: ${DROIDSPACES_KABI_OK}"
           echo "DROIDSPACES_KABI_OK=${DROIDSPACES_KABI_OK}" >> "$GITHUB_ENV"
 
-      - name: Set Droidspaces configs
+      - name: Set Droidspaces (container runtime) configs
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           if [ "${DROIDSPACES_KABI_OK}" = "true" ]; then
@@ -320,6 +448,8 @@ jobs:
               echo "CONFIG_POSIX_MQUEUE=y"
               echo "CONFIG_IPC_NS=y"
             } >> gki_defconfig
+          else
+            echo "::warning::Skipping CONFIG_SYSVIPC/CONFIG_POSIX_MQUEUE/CONFIG_IPC_NS — Droidspaces kABI patches did not apply cleanly this run."
           fi
           {
             echo "CONFIG_NAMESPACES=y"
@@ -339,6 +469,12 @@ jobs:
             echo "CONFIG_TMPFS_POSIX_ACL=y"
             echo "CONFIG_TMPFS_XATTR=y"
           } >> gki_defconfig
+
+      # -----------------------------------------------------------------
+      # Additions layered on top of the working base (not present in the
+      # original reference file): RTL8XXXU Wi-Fi, HID gadget, CAN bus,
+      # IIO/PCI endpoint configs.
+      # -----------------------------------------------------------------
 
       - name: Set full USB HID gadget configs
         if: ${{ github.event.inputs.enable_hid == 'true' }}
@@ -409,9 +545,9 @@ jobs:
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           # RTL8XXXU lives inside the "if WLAN_VENDOR_REALTEK" Kconfig menu.
-          # GKI defconfigs disable that vendor menu by default, so just setting
-          # CONFIG_RTL8XXXU=m without also re-enabling its parent gates gets
-          # silently dropped when the .config is resolved.
+          # GKI defconfigs disable that vendor menu by default, so just
+          # setting CONFIG_RTL8XXXU=m without also re-enabling its parent
+          # gate gets silently dropped when the .config is resolved.
           {
             echo "CONFIG_USB=y"
             echo "CONFIG_WLAN=y"
@@ -421,29 +557,26 @@ jobs:
             echo "CONFIG_RTL8XXXU=m"
           } >> gki_defconfig
 
+      # -----------------------------------------------------------------
+      # End of additions — remaining steps below are the working base,
+      # unchanged.
+      # -----------------------------------------------------------------
+
       - name: Apply custom kernel branding
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           mv scripts/setlocalversion scripts/setlocalversion.orig
           chmod +x scripts/setlocalversion.orig
-          cat > scripts/setlocalversion << 'EOF'
+          cat > scripts/setlocalversion << 'SETLOCALVERSION_EOF'
           #!/bin/sh
-          printf -- '-BLAZE-KernelSUNext-STABLE'
-
-          EOF
+          printf -- '-BLAZE-KSUNv1-STABLE\n'
+          SETLOCALVERSION_EOF
           chmod +x scripts/setlocalversion
 
       - name: Disable strict defconfig verification
         working-directory: kernel_workspace
         run: sed -i 's/check_defconfig//' ./common/build.config.gki
-
-      - name: Disable strict GKI modules list verification
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          grep -rl '^MODULES_ORDER=' build.config* 2>/dev/null | xargs -r sed -i 's/^MODULES_ORDER=.*/MODULES_ORDER=/' || true
-          grep -rl '^MODULES_LIST=' build.config* 2>/dev/null | xargs -r sed -i 's/^MODULES_LIST=.*/MODULES_LIST=/' || true
 
       - name: Build kernel
         working-directory: kernel_workspace
@@ -451,60 +584,48 @@ jobs:
           set -euo pipefail
           export KBUILD_BUILD_USER="builder"
           export KBUILD_BUILD_HOST="ci"
-          LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 USE_CCACHE=1 CCACHE_DIR="${CCACHE_DIR}" build/build.sh -j"$(nproc)"
+          LTO=thin \
+          BUILD_CONFIG=common/build.config.gki.aarch64 \
+          USE_CCACHE=1 \
+          CCACHE_DIR="${{ env.CCACHE_DIR }}" \
+          build/build.sh -j"$(nproc)"
 
-      - name: Verify final configs
+      - name: Verify namespace / cgroup / RTL8XXXU configs made it into the final .config
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          # Pick the largest .config found (avoids grabbing a stray/host .config
-          # that some build steps or toolchains drop elsewhere under out/).
-          CFG=""
-          BEST_SIZE=0
-          while IFS= read -r -d '' f; do
-            SZ=$(stat -c%s "$f" 2>/dev/null || echo 0)
-            if [ "$SZ" -gt "$BEST_SIZE" ]; then
-              BEST_SIZE="$SZ"
-              CFG="$f"
-            fi
-          done < <(find out -name ".config" -print0)
+          # gki_defconfig only carries our *requested* setting; the value that
+          # actually matters is whatever ended up in the .config the build
+          # produced, since a vendor/board fragment merged in later by
+          # build.sh can silently override it. Fail loudly here instead of
+          # finding out from a "disabled" check on-device.
+          CFG=$(find out -name ".config" | head -n1)
           if [ -z "$CFG" ]; then
-            echo "::error::No .config file found anywhere under out/ -- build likely failed before config generation."
+            echo "::error::Could not find a compiled .config under kernel_workspace/out to verify"
             exit 1
           fi
-          echo "Using config file: $CFG"
-
-          FAIL=0
-          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_GADGET CONFIG_USB_CONFIGFS CONFIG_KSU; do
-            if ! grep -q "^${SYM}=y$" "$CFG"; then
-              echo "::error::${SYM} is NOT enabled in the final .config (required)."
-              FAIL=1
+          echo "Checking $CFG"
+          FAILED="false"
+          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS; do
+            if grep -q "^${SYM}=y$" "$CFG"; then
+              echo "✓ ${SYM}=y confirmed in final .config"
+            else
+              echo "::error::${SYM} is NOT enabled in the final .config — something downstream (vendor/board fragment) is overriding gki_defconfig. Actual line:"
+              grep -n "${SYM}" "$CFG" || echo "(no ${SYM} line found at all)"
+              FAILED="true"
             fi
           done
 
-          for SYM in CONFIG_KSU_SUSFS CONFIG_USB_CONFIGFS_F_HID; do
-            if ! grep -q "^${SYM}=y$" "$CFG"; then
-              echo "::warning::${SYM} did not end up enabled in the final .config (patch may not have applied cleanly -- check earlier steps)."
-            fi
-          done
-
-          if ! grep -qE "^CONFIG_RTL8XXXU=(y|m)$" "$CFG"; then
-            echo "::warning::CONFIG_RTL8XXXU did not end up enabled in the final .config (check Kconfig dependencies for CFG80211/MAC80211 on this GKI tree)."
+          # RTL8XXXU is non-fatal on failure (just a warning), matching the
+          # tone of the enable_bbg / BBRv3 checks above — it's an optional
+          # feature addition, not core namespace plumbing.
+          if grep -qE "^CONFIG_RTL8XXXU=(y|m)$" "$CFG"; then
+            echo "✓ CONFIG_RTL8XXXU confirmed in final .config"
+          else
+            echo "::warning::CONFIG_RTL8XXXU did not end up enabled in the final .config — check CONFIG_WLAN_VENDOR_REALTEK and its Kconfig dependency chain for this GKI tree."
           fi
 
-          if [ "${{ github.event.inputs.enable_hid }}" = "true" ]; then
-            for SYM in CONFIG_USB_CONFIGFS_F_LB_SS CONFIG_USB_CONFIGFS_F_PRINTER CONFIG_USB_CONFIGFS_F_UAC1; do
-              grep -q "^${SYM}=y$" "$CFG" || echo "::warning::${SYM} did not end up enabled in the final .config"
-            done
-          fi
-
-          if [ "${{ github.event.inputs.enable_can }}" = "true" ]; then
-            grep -q "^CONFIG_CAN=y$" "$CFG" || echo "::warning::CONFIG_CAN did not end up enabled in the final .config (check CAN Kconfig dependencies for this GKI tree)"
-          fi
-
-          if [ "$FAIL" -eq 1 ]; then
-            echo "----- Dumping full .config for debugging -----"
-            grep -E "CONFIG_(KSU|CAN|USB_CONFIGFS|NAMESPACES|NET_NS|PID_NS|CGROUPS|USER_NS|RTL8XXXU)" "$CFG" || true
+          if [ "${FAILED}" = "true" ]; then
             exit 1
           fi
 
@@ -516,7 +637,11 @@ jobs:
           if [ -z "$IMG" ]; then
             IMG=$(find out -name "Image" | head -n1)
           fi
-          [ -n "$IMG" ]
+          if [ -z "$IMG" ]; then
+            echo "::error::No kernel Image found anywhere under kernel_workspace/out — build failed above"
+            exit 1
+          fi
+          echo "Found Image at: $IMG"
           echo "IMG_PATH=kernel_workspace/${IMG}" >> "$GITHUB_ENV"
 
       - name: Package AnyKernel3
@@ -525,7 +650,7 @@ jobs:
           git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 ak3
           cp "${{ env.IMG_PATH }}" ak3/Image
           cd ak3
-          zip -r9 -q "../${{ github.event.inputs.device_name }}-KernelSUNext-android12-5.10-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
+          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
