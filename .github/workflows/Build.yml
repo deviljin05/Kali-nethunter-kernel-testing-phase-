@@ -8,9 +8,9 @@ on:
         required: true
         default: "android12-5.10.264_r00"
       susfs_commit:
-        description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch)"
+        description: "SUSFS commit hash. Pinned to a known-working commit for gki-android12-5.10 (latest branch HEAD has occasionally shipped a 50_add_susfs patch out of sync with its own headers, e.g. calling susfs_sus_kstat_spoof_vfs_statfs with no matching declaration). Leave as-is unless you know a newer commit is safe; clear it only if you're deliberately testing latest."
         required: false
-        default: ""
+        default: "6f42c0e24e35a6fa0fc43051a5f1e7dfe568e8c2"
       device_name:
         description: "Optional label for artifact naming"
         required: false
@@ -153,6 +153,31 @@ jobs:
         run: |
           set -euo pipefail
           patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch
+
+      - name: Verify SUSFS patch/header consistency
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          # The SUSFS patch inserts calls to susfs_* functions into stock kernel
+          # files (fs/statfs.c, fs/stat.c, etc.), and those functions must be
+          # declared in the headers copied from susfs4ksu/kernel_patches/include/linux.
+          # If the pinned susfs_commit's patch and headers ever drift out of sync,
+          # a call gets added with no matching declaration and the build fails
+          # deep inside compilation with an obscure
+          # "implicit declaration of function ..." error. Catch that here instead,
+          # right after patching, with a clear message naming the missing symbol.
+          MISSING=""
+          for FN in $(grep -ohE 'susfs_[a-zA-Z0-9_]+' fs/statfs.c fs/stat.c 2>/dev/null | sort -u); do
+            if ! grep -rq "${FN}" include/linux/susfs*.h 2>/dev/null; then
+              MISSING="${MISSING} ${FN}"
+            fi
+          done
+          if [ -n "${MISSING}" ]; then
+            echo "ERROR: SUSFS patch calls functions with no matching header declaration:${MISSING}"
+            echo "This means the pinned susfs_commit's patch and its headers are out of sync upstream."
+            echo "Try pinning susfs_commit to a different known-working commit."
+            exit 1
+          fi
 
       - name: Fix SUSFS set_nameidata argument mismatch
         working-directory: kernel_workspace/common
@@ -422,6 +447,27 @@ jobs:
           grep -rl '^MODULES_ORDER=' build.config* 2>/dev/null | xargs -r sed -i 's/^MODULES_ORDER=.*/MODULES_ORDER=/' || true
           # Also cover MODULES_LIST in case a downstream config uses that name instead.
           grep -rl '^MODULES_LIST=' build.config* 2>/dev/null | xargs -r sed -i 's/^MODULES_LIST=.*/MODULES_LIST=/' || true
+
+      - name: Ensure generic ld exists for tools that don't pass -fuse-ld=lld
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          # Baseband Guard's SELinux header generation builds a host tool
+          # (genheaders) that produces flask.h/av_permissions.h. That tool's
+          # build invokes clang without -fuse-ld=lld, so it looks for a plain
+          # "ld" executable. Only ld.lld ships in prebuilts-master, so the link
+          # fails ("Executable \"ld\" doesn't exist!"), genheaders never gets
+          # built, and the later `mv ./flask.h`/`mv ./av_permissions.h` steps
+          # fail because those files were never generated. Symlinking ld ->
+          # ld.lld in the same bin dir gives clang a "ld" to find.
+          LLD_PATH=$(find prebuilts-master -type f -name 'ld.lld' | head -n1)
+          if [ -n "$LLD_PATH" ]; then
+            BIN_DIR=$(dirname "$LLD_PATH")
+            [ -e "$BIN_DIR/ld" ] || ln -s ld.lld "$BIN_DIR/ld"
+            echo "Symlinked ld -> ld.lld in $BIN_DIR"
+          else
+            echo "::warning::no ld.lld found under prebuilts-master"
+          fi
 
       - name: Build kernel
         working-directory: kernel_workspace
