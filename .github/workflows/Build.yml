@@ -51,7 +51,9 @@ jobs:
       - name: Add swap for LTO builds
         run: |
           set -euo pipefail
-          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384 status=progress
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
@@ -491,7 +493,8 @@ jobs:
           git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 ak3
           cp "${{ env.IMG_PATH }}" ak3/Image
           cd ak3
-          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-susfs${SUSFS_REQUESTED_COMMIT:0:8}.zip" . -x ".git*"
+          ZIP_NAME="${{ github.event.inputs.device_name }}-Blaze-android12-5.10-susfs${SUSFS_REQUESTED_COMMIT:0:8}.zip"
+          zip -r9 -q "../${ZIP_NAME}" . -x ".git*"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
