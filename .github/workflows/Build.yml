@@ -1,28 +1,22 @@
 name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3 + RTL8XXXU + HID/CAN)
 # ============================================================================
-# Base build flow is copied verbatim from the user's proven-working
-# reference (Wild KSU + SUSFS + BBRv3). On top of that, four groups of
-# additions are layered in as pure additions -- nothing in the base flow
-# below is altered:
-#  - RTL8XXXU (Realtek RTL8188 family USB Wi-Fi) driver support, including
-#    its parent Kconfig gate CONFIG_WLAN_VENDOR_REALTEK which GKI defconfigs
-#    disable by default (setting CONFIG_RTL8XXXU=m alone is a no-op without
-#    also re-enabling that parent gate)
-#  - Full USB HID gadget support (toggle via enable_hid)
-#  - CAN bus support (toggle via enable_can)
-#  - IIO / PCI endpoint configfs configs
+# Base = working sample (verbatim). Additions layered on top:
+#  - RTL8XXXU (=y, built-in — AnyKernel3 only ships Image, so =m would be
+#    silently useless)
+#  - USB HID gadget support (toggle: enable_hid)
+#  - CAN bus support (toggle: enable_can)
+#  - IIO / PCI endpoint configfs
 #
-# NOTE: RTL8XXXU is set to =y (built-in), NOT =m. AnyKernel3 only ships the
-# Image; loadable .ko files would never reach the device, so =m would be
-# silently useless here.
-#
-# NOTE ON CONFIG_NAMESPACES / CONFIG_NET_NS / CONFIG_CGROUPS:
-# These are already default-y on virtually all GKI android12-5.10
-# defconfigs, so explicitly forcing them below is a no-op in the normal
-# case. They were added back in on explicit user request.
-#
-# NOTE ON CONFIG_USER_NS:
-# Per user request, this build now DOES force CONFIG_USER_NS=y.
+# Safety additions (needed because the additions push the build into a
+# path where these surface — see error analysis):
+#  1) Symlink ld -> ld.lld in clang prebuilts (fixes
+#     "clang-12: error: unable to execute command: Executable 'ld' doesn't exist!")
+#  2) Add CONFIG_KPROBES=y alongside CONFIG_KSU_SUSFS=y (fixes
+#     drivers/kernelsu/Kbuild:3: *** "KernelSU requires either
+#     CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")
+#  3) Re-assert KSU/SUSFS/KPROBES configs after KernelSU-Next setup.sh
+#     (setup.sh rewrites Kconfig, so earlier appends can be dropped on
+#     defconfig re-resolve)
 # ============================================================================
 
 on:
@@ -121,7 +115,7 @@ jobs:
           set -euo pipefail
           REMOTE_NAME="$(git remote | head -n1)"
           if [ -z "${REMOTE_NAME}" ]; then
-            echo "::error::No git remote found in kernel_workspace/common"
+            echo "::error::No git remote found in kernel_workspace/common — cannot fetch pinned tag"
             exit 1
           fi
           echo "Using remote '${REMOTE_NAME}' to fetch tag ${PIN_TAG}"
@@ -136,13 +130,15 @@ jobs:
           echo "Detected SUBLEVEL: $SUBLEVEL"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
-      # -----------------------------------------------------------------
-      # FIX for "clang-12: error: unable to execute command: Executable
-      # 'ld' doesn't exist!" -- AOSP clang prebuilts ship ld.lld but not
-      # a bare "ld", which some host-tool (genheaders for BBG/SELinux)
-      # builds invoke directly. Create the symlink up-front.
-      # -----------------------------------------------------------------
-      - name: Symlink ld -> ld.lld in clang prebuilts (fix missing ld)
+      # ===================================================================
+      # SAFETY 1: symlink ld -> ld.lld in clang prebuilts. AOSP clang ships
+      # ld.lld but not a bare "ld". BBG's flask.h regeneration path
+      # (triggered during mrproper on some configs) invokes host "ld"
+      # directly, producing:
+      #   clang-12: error: unable to execute command: Executable "ld" doesn't exist!
+      # Harmless if not needed — only creates the symlink when missing.
+      # ===================================================================
+      - name: Symlink ld -> ld.lld in clang prebuilts
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
@@ -156,32 +152,17 @@ jobs:
                 echo "Linked ${BIN}/ld -> ld.lld"
                 FOUND=1
               fi
-              if [ -e "${BIN}/llvm-ld" ] && [ ! -e "${BIN}/ld" ]; then
-                ln -sf "${BIN}/llvm-ld" "${BIN}/ld"
-                echo "Linked ${BIN}/ld -> llvm-ld"
-                FOUND=1
-              fi
             done < <(find "$BASE" -type d -name bin 2>/dev/null)
           done
-          # Fallback: also link into the build-tools PATH dir if present
-          BT="build/build-tools/path/linux-x86"
-          if [ -d "$BT" ]; then
-            CLANG_BIN="$(find prebuilts-master/clang -type d -name bin 2>/dev/null | head -n1 || true)"
-            if [ -n "$CLANG_BIN" ] && [ -e "${CLANG_BIN}/ld.lld" ] && [ ! -e "${BT}/ld" ]; then
-              ln -sf "${CLANG_BIN}/ld.lld" "${BT}/ld"
-              echo "Linked ${BT}/ld -> ${CLANG_BIN}/ld.lld"
-              FOUND=1
-            fi
-          fi
           if [ "$FOUND" = "0" ]; then
-            echo "::warning::Could not find a clang bin dir to symlink ld into — build may still fail on genheaders"
+            echo "::warning::No clang bin dir found for ld symlink — if build fails on genheaders, this is why"
           fi
 
       - name: Clone SUSFS4KSU (latest = current SUSFS release)
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "gki-${{ env.VERSION }}" susfs4ksu
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android12-5.10 susfs4ksu
           cd susfs4ksu
           if [ -n "${{ github.event.inputs.susfs_commit }}" ]; then
             git checkout "${{ github.event.inputs.susfs_commit }}"
@@ -189,6 +170,12 @@ jobs:
           echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "SUSFS commit in use: $(git rev-parse HEAD) — $(git log -1 --format=%s)"
 
+      # ===================================================================
+      # SAFETY 2: CONFIG_KPROBES=y added alongside CONFIG_KSU_SUSFS=y. The
+      # Kbuild gate at drivers/kernelsu/Kbuild:3 fires its $(error ...)
+      # during mrproper (before .config is applied), so belt-and-braces
+      # setting KPROBES makes the gate pass even on the pre-config pass.
+      # ===================================================================
       - name: Set SUSFS kernel configs
         run: |
           cd kernel_workspace/common/arch/arm64/configs
@@ -204,10 +191,6 @@ jobs:
             echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
             echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
             echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
-            # FIX for: KernelSU requires either CONFIG_KPROBES=y or
-            # CONFIG_KSU_SUSFS=y — the Kbuild check in
-            # drivers/kernelsu/Kbuild runs *before* our appended configs
-            # always get honoured, so belt-and-braces set KPROBES too.
             echo "CONFIG_KPROBES=y"
             echo "CONFIG_HAVE_KPROBES=y"
             echo "CONFIG_KPROBE_EVENTS=y"
@@ -288,15 +271,12 @@ jobs:
             https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/kernelsu/patches/static.patch
           patch -p1 --forward < static.patch || echo "::warning::static.patch did not apply — may already be fixed upstream, not fatal"
 
-      # -----------------------------------------------------------------
-      # Re-assert SUSFS/KPROBES configs AFTER KernelSU-Next setup.sh runs,
-      # because setup.sh rewrites drivers/kernelsu/Kconfig and its Kbuild
-      # gate checks the *resolved* .config before our earlier appends have
-      # necessarily survived a config merge. This is the actual fix for:
-      #   drivers/kernelsu/Kbuild:3: *** "KernelSU requires either
-      #   CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y". Stop.
-      # -----------------------------------------------------------------
-      - name: Re-assert KernelSU/SUSFS/KPROBES configs after KSU-Next setup
+      # ===================================================================
+      # SAFETY 3: re-assert KSU/SUSFS/KPROBES after KSU-Next setup.sh.
+      # setup.sh rewrites drivers/kernelsu/Kconfig and can drop earlier
+      # gki_defconfig appends during defconfig re-resolve.
+      # ===================================================================
+      - name: Re-assert KSU/SUSFS/KPROBES configs after KSU-Next setup
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
@@ -344,8 +324,8 @@ jobs:
 
       - name: Enable BBG config
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
-        working-directory: kernel_workspace/common/arch/arm64/configs
         run: |
+          cd kernel_workspace/common/arch/arm64/configs
           echo "CONFIG_BBG=y" >> gki_defconfig
 
       - name: Apply BBRv3 backport
@@ -410,16 +390,16 @@ jobs:
           if [ "${SUBLEVEL}" -le "208" ]; then
             curl -LSs -o /tmp/0003-lockdep-assert-none-held.patch \
               https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/ntsync/patches/0003-lockdep-assert-none-held.patch
-            patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || echo "::warning::lockdep fix did not apply"
+            patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || echo "::warning::lockdep fix did not apply — may already be present"
           fi
 
           curl -LSs -o /tmp/ntsync_compat_android12-5.10.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_compat_android12-5.10.patch
-          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || { echo "::warning::ntsync compat patch had rejects:"; find . -name "*.rej"; }
+          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || { echo "::warning::ntsync compat rejects:"; find . -name "*.rej"; }
 
           curl -LSs -o /tmp/ntsync_base.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_base.patch
-          patch -p1 < /tmp/ntsync_base.patch || { echo "::warning::ntsync base patch had rejects:"; find . -name "*.rej"; }
+          patch -p1 < /tmp/ntsync_base.patch || { echo "::warning::ntsync base rejects:"; find . -name "*.rej"; }
 
           echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
 
@@ -432,7 +412,7 @@ jobs:
           curl -LSs -o /tmp/droidspaces_sysvipc_kabi.patch \
             https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
           if ! patch -p1 < /tmp/droidspaces_sysvipc_kabi.patch; then
-            echo "::warning::Droidspaces SYSVIPC kABI patch had rejects. Skipping configs to avoid bootloop."
+            echo "::warning::Droidspaces SYSVIPC kABI patch rejects — skipping configs to avoid bootloop"
             find . -name "*.rej"
             DROIDSPACES_KABI_OK="false"
           fi
@@ -440,7 +420,7 @@ jobs:
           curl -LSs -o /tmp/droidspaces_posix_mqueue_kabi.patch \
             https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
           if ! patch -p1 < /tmp/droidspaces_posix_mqueue_kabi.patch; then
-            echo "::warning::Droidspaces POSIX_MQUEUE kABI patch had rejects. Skipping configs to avoid bootloop."
+            echo "::warning::Droidspaces POSIX_MQUEUE kABI patch rejects — skipping configs to avoid bootloop"
             find . -name "*.rej"
             DROIDSPACES_KABI_OK="false"
           fi
@@ -458,7 +438,7 @@ jobs:
               echo "CONFIG_IPC_NS=y"
             } >> gki_defconfig
           else
-            echo "::warning::Skipping CONFIG_SYSVIPC/CONFIG_POSIX_MQUEUE/CONFIG_IPC_NS — Droidspaces kABI patches did not apply cleanly this run."
+            echo "::warning::Skipping CONFIG_SYSVIPC/CONFIG_POSIX_MQUEUE/CONFIG_IPC_NS — kABI patches failed"
           fi
           {
             echo "CONFIG_NAMESPACES=y"
@@ -479,9 +459,15 @@ jobs:
             echo "CONFIG_TMPFS_XATTR=y"
           } >> gki_defconfig
 
+      # ===================================================================
+      # User-requested additions (not present in the working base):
+      # USB HID gadget, CAN bus, IIO/PCI endpoint, RTL8XXXU Wi-Fi.
+      # ===================================================================
+
       - name: Set full USB HID gadget configs
         if: ${{ github.event.inputs.enable_hid == 'true' }}
         run: |
+          set -euo pipefail
           cd kernel_workspace/common/arch/arm64/configs
           {
             echo "CONFIG_USB_GADGET=y"
@@ -511,6 +497,7 @@ jobs:
       - name: Set CAN bus configs
         if: ${{ github.event.inputs.enable_can == 'true' }}
         run: |
+          set -euo pipefail
           cd kernel_workspace/common/arch/arm64/configs
           {
             echo "CONFIG_CAN=y"
@@ -536,6 +523,7 @@ jobs:
 
       - name: Set IIO / PCI endpoint configfs configs
         run: |
+          set -euo pipefail
           cd kernel_workspace/common/arch/arm64/configs
           {
             echo "CONFIG_IIO=y"
@@ -546,10 +534,13 @@ jobs:
 
       - name: Set USB Wi-Fi adapter driver configs (RTL8188/rtl8xxxu family)
         run: |
+          set -euo pipefail
           cd kernel_workspace/common/arch/arm64/configs
-          # RTL8XXXU lives inside the "if WLAN_VENDOR_REALTEK" Kconfig menu.
-          # NOTE: =y (built-in), NOT =m — AnyKernel3 only ships the Image,
-          # so loadable .ko modules would never reach the device.
+          # RTL8XXXU lives inside "if WLAN_VENDOR_REALTEK". GKI defconfigs
+          # disable that vendor gate by default; without re-enabling the
+          # parent, CONFIG_RTL8XXXU alone is silently dropped.
+          # NOTE: =y (built-in), NOT =m — AnyKernel3 only ships Image, so
+          # loadable .ko modules would never reach the device.
           {
             echo "CONFIG_USB=y"
             echo "CONFIG_WLAN=y"
@@ -558,6 +549,10 @@ jobs:
             echo "CONFIG_WLAN_VENDOR_REALTEK=y"
             echo "CONFIG_RTL8XXXU=y"
           } >> gki_defconfig
+
+      # ===================================================================
+      # End of additions — remainder is working-sample flow, unchanged.
+      # ===================================================================
 
       - name: Apply custom kernel branding
         working-directory: kernel_workspace/common
@@ -579,8 +574,8 @@ jobs:
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          # Re-export PATH with the freshly-symlinked clang bin in front so
-          # any host-tool invocation (genheaders etc.) can find "ld".
+          # Prepend the freshly-symlinked clang bin dir so any host-tool
+          # invocation (genheaders for BBG/SELinux) can find "ld".
           CLANG_BIN="$(find prebuilts-master/clang -type d -name bin 2>/dev/null | head -n1 || true)"
           if [ -n "$CLANG_BIN" ]; then
             export PATH="${CLANG_BIN}:${PATH}"
@@ -593,7 +588,7 @@ jobs:
           CCACHE_DIR="${{ env.CCACHE_DIR }}" \
           build/build.sh -j"$(nproc)"
 
-      - name: Verify namespace / cgroup / RTL8XXXU configs made it into the final .config
+      - name: Verify key configs made it into the final .config
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
@@ -613,13 +608,11 @@ jobs:
               FAILED="true"
             fi
           done
-
           if grep -qE "^CONFIG_RTL8XXXU=(y|m)$" "$CFG"; then
             echo "✓ CONFIG_RTL8XXXU confirmed in final .config"
           else
             echo "::warning::CONFIG_RTL8XXXU did not end up enabled in the final .config"
           fi
-
           if [ "${FAILED}" = "true" ]; then
             exit 1
           fi
@@ -633,7 +626,7 @@ jobs:
             IMG=$(find out -name "Image" | head -n1)
           fi
           if [ -z "$IMG" ]; then
-            echo "::error::No kernel Image found anywhere under kernel_workspace/out — build failed above"
+            echo "::error::No kernel Image found under kernel_workspace/out — build failed above"
             exit 1
           fi
           echo "Found Image at: $IMG"
