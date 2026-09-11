@@ -113,10 +113,6 @@ jobs:
           SUBLEVEL="$(grep -m1 '^SUBLEVEL = ' common/Makefile | awk '{print $3}')"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
-      # ==========================================================
-      # FIX A: Symlink system ld/lld into the Android prebuilt clang dir
-      # Android clang-12 looks for "ld" next to itself, not in /usr/bin.
-      # ==========================================================
       - name: Symlink ld/lld into Android prebuilt clang path
         working-directory: kernel_workspace
         run: |
@@ -138,7 +134,6 @@ jobs:
           fi
           echo "Clang bin directory: ${CLANG_BIN}"
           ls -la "${CLANG_BIN}" | grep -E 'clang|ld' || true
-          # Symlink system lld / ld into the clang dir
           if [ -x /usr/bin/ld.lld ]; then
             ln -sf /usr/bin/ld.lld "${CLANG_BIN}/ld.lld"
             echo "Symlinked /usr/bin/ld.lld -> ${CLANG_BIN}/ld.lld"
@@ -287,11 +282,6 @@ jobs:
           cd ..
           bash KernelSU-Next/kernel/setup.sh "${KSU_NEXT_BRANCH}"
 
-      # ==========================================================
-      # FIX B: KernelSU Kbuild guard — use sed directly, no python heredoc
-      # The $(error) fires during mrproper (clean phase), where .config
-      # is not loaded yet. Guard it so it only fires during actual build.
-      # ==========================================================
       - name: Guard KernelSU Kbuild error for clean phase only
         working-directory: kernel_workspace/common
         run: |
@@ -303,14 +293,18 @@ jobs:
           fi
           echo "=== Original Kbuild (first 10 lines) ==="
           sed -n '1,10p' "$KB"
-          # Direct sed replacement — no python needed
           sed -i 's|\$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")|$(if $(filter clean mrproper,$(MAKECMDGOALS)),,$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y"))|g' "$KB"
           echo "=== Patched Kbuild (first 10 lines) ==="
           sed -n '1,10p' "$KB"
-          # Verify the replacement actually happened
-          if grep -q '\$(error "KernelSU requires' "$KB"; then
-            echo "::error::Kbuild patch did NOT apply — pattern not found"
+          # Verify: check for the GUARDED pattern (not the raw $(error ...))
+          if ! grep -q 'filter clean mrproper' "$KB"; then
+            echo "::error::Kbuild patch did NOT apply — guarded pattern not found"
             grep -n 'KernelSU requires' "$KB" || true
+            exit 1
+          fi
+          # Ensure the raw unguarded $(error ...) is gone
+          if grep -q '^\$(error "KernelSU requires' "$KB"; then
+            echo "::error::Unguarded \$(error ...) still present"
             exit 1
           fi
           echo "✓ Kbuild guarded successfully"
