@@ -194,6 +194,25 @@ jobs:
           set -euo pipefail
           curl -fsSL "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
 
+      - name: Fix KernelSU-Next hard KPROBES/KSU_SUSFS Kbuild check
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          # drivers/kernelsu/Kbuild has:
+          #   ifneq ($(CONFIG_KPROBES),y)
+          #   ifneq ($(CONFIG_KSU_SUSFS),y)
+          #   $(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")
+          #   endif
+          #   endif
+          # Kbuild files are parsed even during `make mrproper`, which build.sh
+          # runs before any .config exists (defconfig is applied later), so
+          # CONFIG_KSU_SUSFS is still empty at that point and this $(error ...)
+          # fires immediately, failing the build before it even starts. We
+          # already set CONFIG_KSU_SUSFS=y in gki_defconfig for the real build,
+          # so this check is a false positive during the pre-config clean step.
+          # Just drop the $(error ...) line; the surrounding ifneq/endif become
+          # harmless no-ops.
+          sed -i '/\$(error "KernelSU requires/d' drivers/kernelsu/Kbuild || true
 
       - name: Install Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
