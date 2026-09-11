@@ -31,7 +31,6 @@ env:
   KSU_NEXT_BRANCH: "dev-susfs"
   SUSFS_REPO: "https://gitlab.com/simonpunk/susfs4ksu.git"
   SUSFS_BRANCH: "gki-android12-5.10"
-  SUSFS_PINNED_COMMIT: "ec785f4a22b8e2e6e5e8e5f5f5f5f5f5f5f5f5f5"
 
 jobs:
   build:
@@ -101,15 +100,12 @@ jobs:
           SUBLEVEL="$(grep -m1 '^SUBLEVEL = ' common/Makefile | awk '{print $3}')"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
-      - name: Clone SUSFS4KSU
+      - name: Clone SUSFS4KSU (auto latest)
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
           git clone --depth 1 -b "${SUSFS_BRANCH}" "${SUSFS_REPO}" susfs4ksu
-          cd susfs4ksu
-          git fetch --depth 1 origin "${SUSFS_PINNED_COMMIT}"
-          git checkout "${SUSFS_PINNED_COMMIT}"
-          echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SUSFS_COMMIT=$(git -C susfs4ksu rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Set SUSFS kernel configs
         run: |
@@ -221,9 +217,7 @@ jobs:
         run: |
           set -euo pipefail
           git clone "${KSU_NEXT_REPO}" -b "${KSU_NEXT_BRANCH}" KernelSU-Next
-          cd KernelSU-Next
-          echo "KSU_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          cd ..
+          echo "KSU_COMMIT=$(git -C KernelSU-Next rev-parse HEAD)" >> "$GITHUB_ENV"
           bash KernelSU-Next/kernel/setup.sh "${KSU_NEXT_BRANCH}"
 
       - name: Install Baseband Guard
