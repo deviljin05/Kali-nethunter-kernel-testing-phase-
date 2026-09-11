@@ -11,10 +11,6 @@ on:
         description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch)"
         required: false
         default: ""
-      ksu_ref:
-        description: "KernelSU-Next branch/tag/commit to check out (e.g. next, or a pinned release tag)"
-        required: true
-        default: "next"
       device_name:
         description: "Optional label for artifact naming"
         required: false
@@ -160,7 +156,11 @@ jobs:
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch
+          if ! patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch; then
+            echo "::error::SUSFS patch failed to apply cleanly — .rej files below:"
+            find . -name "*.rej"
+            exit 1
+          fi
 
       - name: Fix SUSFS set_nameidata argument mismatch
         working-directory: kernel_workspace/common
@@ -196,30 +196,24 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      - name: Setup KernelSU-Next
+      - name: Setup KernelSU-Next (pershoot fork, dev-susfs branch)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          curl -fsSL "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "${{ github.event.inputs.ksu_ref }}"
-          echo "KSU_COMMIT=$(git -C KernelSU-Next rev-parse HEAD 2>/dev/null || git -C KernelSU rev-parse HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
+          # The dev-susfs branch of pershoot/KernelSU-Next has SUSFS hooks
+          # natively built into the driver source already -- unlike the
+          # upstream KernelSU-Next/KernelSU-Next repo, there is no separate
+          # patch step needed here for CONFIG_KSU_SUSFS to bind correctly.
+          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
+          echo "KSU_COMMIT=$(git -C KernelSU-Next rev-parse HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
 
-      - name: Apply SUSFS patch to the KernelSU-Next driver
-        working-directory: kernel_workspace/common
+      - name: Fix KernelSU-Next (static.patch)
+        working-directory: kernel_workspace/common/KernelSU-Next
         run: |
           set -euo pipefail
-          KSU_DIR="KernelSU-Next"
-          [ -d "$KSU_DIR" ] || KSU_DIR="KernelSU"
-          cd "$KSU_DIR"
-          PATCH_SRC="../../susfs4ksu/kernel_patches/KernelSU-Next/10_enable_susfs_for_ksu.patch"
-          [ -f "$PATCH_SRC" ] || PATCH_SRC="../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
-          cp "$PATCH_SRC" ./
-          if grep -rq "CONFIG_KSU_SUSFS" . 2>/dev/null; then
-            echo "::notice::SUSFS hooks already present in KernelSU-Next driver tree, skipping patch."
-          elif patch -p1 --fuzz=3 --dry-run < 10_enable_susfs_for_ksu.patch >/dev/null 2>&1; then
-            patch -p1 --fuzz=3 < 10_enable_susfs_for_ksu.patch
-          else
-            echo "::warning::10_enable_susfs_for_ksu.patch did not apply cleanly against KernelSU-Next -- continuing, but check CONFIG_KSU_SUSFS in 'Verify final configs' below."
-          fi
+          curl -LSs -o static.patch \
+            https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/kernelsu/patches/static.patch
+          patch -p1 --forward < static.patch || echo "::warning::static.patch did not apply — may already be fixed upstream, not fatal"
 
       - name: Install Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -257,6 +251,13 @@ jobs:
           echo "BBR_CONG_NAME=${BBR_CONG_NAME}" >> "$GITHUB_ENV"
           echo "BBRV3_PATCH_APPLIED=${BBRV3_PATCH_APPLIED}" >> "$GITHUB_ENV"
 
+          if ! grep -qF 'int proc_dou8vec_minmax(' ./include/linux/sysctl.h; then
+            for p in sysctl_add_proc_dou8vec_minmax.patch sysctl_fix_data-races_in_proc_dou8vec_minmax.patch; do
+              PF="/tmp/wildpatches/common/bbrv3/$p"
+              [ -f "$PF" ] && { patch -p1 < "$PF" || echo "::warning::$p did not apply cleanly"; }
+            done
+          fi
+
       - name: Set networking / TCP congestion configs
         run: |
           cd kernel_workspace/common/arch/arm64/configs
@@ -270,7 +271,7 @@ jobs:
             if [ "${BBRV3_PATCH_APPLIED}" = "true" ]; then
               echo "CONFIG_TCP_CONG_BBR3=y"
             fi
-            echo "CONFIG_DEFAULT_TCP_CONG=${BBR_CONG_NAME}"
+            echo "CONFIG_DEFAULT_TCP_CONG=\"${BBR_CONG_NAME}\""
             echo "CONFIG_NET_SCH_FQ=y"
             echo "CONFIG_NET_SCH_FQ_CODEL=y"
             echo "CONFIG_NET_SCH_CAKE=y"
@@ -407,9 +408,16 @@ jobs:
       - name: Set USB Wi-Fi adapter driver configs (RTL8188/rtl8xxxu family)
         run: |
           cd kernel_workspace/common/arch/arm64/configs
+          # RTL8XXXU lives inside the "if WLAN_VENDOR_REALTEK" Kconfig menu.
+          # GKI defconfigs disable that vendor menu by default, so just setting
+          # CONFIG_RTL8XXXU=m without also re-enabling its parent gates gets
+          # silently dropped when the .config is resolved.
           {
+            echo "CONFIG_USB=y"
+            echo "CONFIG_WLAN=y"
             echo "CONFIG_CFG80211=y"
             echo "CONFIG_MAC80211=y"
+            echo "CONFIG_WLAN_VENDOR_REALTEK=y"
             echo "CONFIG_RTL8XXXU=m"
           } >> gki_defconfig
 
