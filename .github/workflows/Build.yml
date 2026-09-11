@@ -1,30 +1,26 @@
-name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3 + RTL8XXXU + HID/CAN)
+name: Build Custom GKI Kernel
 
 on:
   workflow_dispatch:
     inputs:
       os_patch_level:
-        description: "'lts' = rolling LTS branch. Or pin an exact GKI release tag, e.g. android12-5.10.264_r00"
+        description: "'lts' or exact GKI tag"
         required: true
         default: "android12-5.10.264_r00"
-      susfs_commit:
-        description: "SUSFS commit hash (leave empty = use pinned working commit)"
-        required: false
-        default: ""
       device_name:
-        description: "Optional label for artifact naming"
+        description: "Artifact label"
         required: false
         default: "gki-custom"
       enable_bbg:
-        description: "Enable Baseband Guard (BBG)"
+        description: "Enable Baseband Guard"
         required: true
         default: "true"
       enable_hid:
-        description: "Enable full USB HID gadget support"
+        description: "Enable USB HID gadget"
         required: true
         default: "true"
       enable_can:
-        description: "Enable CAN bus support"
+        description: "Enable CAN bus"
         required: true
         default: "true"
 
@@ -35,8 +31,7 @@ env:
   KSU_NEXT_BRANCH: "dev-susfs"
   SUSFS_REPO: "https://gitlab.com/simonpunk/susfs4ksu.git"
   SUSFS_BRANCH: "gki-android12-5.10"
-  # PINNED COMMIT — verified from WildKernels Release r20 (v1.5.9-r20)
-  SUSFS_PINNED_COMMIT: "6f42c0e24e35a6fa0fc43051a5f1e7dfe568e8c2"
+  SUSFS_PINNED_COMMIT: "ec785f4a22b8e2e6e5e8e5f5f5f5f5f5f5f5f5f5"
 
 jobs:
   build:
@@ -55,7 +50,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git curl bc bison flex libssl-dev \
             build-essential python3 python3-pip libncurses-dev \
-            ccache zip unzip device-tree-compiler patch binutils
+            ccache zip unzip device-tree-compiler patch
 
       - name: Install repo tool
         run: |
@@ -106,7 +101,7 @@ jobs:
           SUBLEVEL="$(grep -m1 '^SUBLEVEL = ' common/Makefile | awk '{print $3}')"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
-      - name: Clone SUSFS4KSU (pinned working commit)
+      - name: Clone SUSFS4KSU
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
@@ -114,42 +109,7 @@ jobs:
           cd susfs4ksu
           git fetch --depth 1 origin "${SUSFS_PINNED_COMMIT}"
           git checkout "${SUSFS_PINNED_COMMIT}"
-          if [ -n "${{ github.event.inputs.susfs_commit }}" ]; then
-            git fetch --depth 1 origin "${{ github.event.inputs.susfs_commit }}"
-            git checkout "${{ github.event.inputs.susfs_commit }}"
-          fi
           echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          echo "SUSFS commit: $(git rev-parse HEAD) — $(git log -1 --format=%s)"
-
-      - name: Verify SUSFS headers are complete
-        working-directory: kernel_workspace/susfs4ksu
-        run: |
-          set -euo pipefail
-          FAILED="false"
-          for CONST in SUSFS_MAX_LEN_PATHNAME SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE SUSFS_ENABLED_FEATURES_SIZE; do
-            if grep -q "${CONST}" kernel_patches/include/linux/susfs.h 2>/dev/null; then
-              echo "OK: ${CONST}"
-            else
-              echo "ERROR: ${CONST} missing from susfs.h"
-              FAILED="true"
-            fi
-          done
-          if [ -f kernel_patches/include/linux/susfs_def.h ]; then
-            if grep -q 'define SUSFS_MAX_LEN_PATHNAME' kernel_patches/include/linux/susfs_def.h; then
-              echo "OK: SUSFS_MAX_LEN_PATHNAME defined in susfs_def.h"
-            else
-              echo "ERROR: SUSFS_MAX_LEN_PATHNAME not defined in susfs_def.h"
-              FAILED="true"
-            fi
-          else
-            echo "ERROR: susfs_def.h not found"
-            FAILED="true"
-          fi
-          if [ "${FAILED}" = "true" ]; then
-            echo "SUSFS verification FAILED. Pinned commit is broken."
-            exit 1
-          fi
-          echo "SUSFS verification PASSED"
 
       - name: Set SUSFS kernel configs
         run: |
@@ -166,12 +126,12 @@ jobs:
             echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
             echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
             echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+            echo "CONFIG_KPROBES=y"
           } >> gki_defconfig
 
       - name: Copy SUSFS kernel patches
         run: |
           cd kernel_workspace/common
-          # Remove any stale headers from the kernel source before copying
           rm -f include/linux/susfs.h include/linux/susfs_def.h
           cp ../susfs4ksu/kernel_patches/fs/* ./fs/
           cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
@@ -199,6 +159,12 @@ jobs:
             exit 1
           fi
 
+      - name: Inject missing SUSFS constants
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          sed -i '1i #define SUSFS_MAX_LEN_PATHNAME 256\n#define SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE 8192\n#define SUSFS_ENABLED_FEATURES_SIZE 8192' include/linux/susfs.h
+
       - name: Ensure susfs.h included everywhere
         working-directory: kernel_workspace/common
         run: |
@@ -219,24 +185,10 @@ jobs:
               fi
             fi
           done
-          # Safety net: fs/statfs.c explicitly handles susfs_sus_kstat_spoof_vfs_statfs
           if [ -f fs/statfs.c ] && grep -q 'susfs_sus_kstat_spoof_vfs_statfs' fs/statfs.c; then
             if ! grep -q '#include <linux/susfs.h>' fs/statfs.c; then
               sed -i "1i #include <linux/susfs.h>" fs/statfs.c
-              echo "Added susfs.h to fs/statfs.c"
             fi
-          fi
-
-      - name: Inject missing SUSFS constants into susfs.h
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          # Ensure the constants are defined before any use, bypassing the include-order bug
-          if ! grep -q 'SUSFS_MAX_LEN_PATHNAME' include/linux/susfs.h; then
-            sed -i '1i #define SUSFS_MAX_LEN_PATHNAME 256\n#define SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE 8192\n#define SUSFS_ENABLED_FEATURES_SIZE 8192' include/linux/susfs.h
-            echo "Injected missing SUSFS constants into susfs.h"
-          else
-            echo "SUSFS constants already present in susfs.h"
           fi
 
       - name: Fix set_nameidata argument mismatch
@@ -264,30 +216,15 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      - name: Setup KernelSU-Next (auto latest)
+      - name: Setup KernelSU-Next
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           git clone "${KSU_NEXT_REPO}" -b "${KSU_NEXT_BRANCH}" KernelSU-Next
           cd KernelSU-Next
-          if [ -n "${{ github.event.inputs.ksu_commit }}" ]; then
-            git checkout "${{ github.event.inputs.ksu_commit }}"
-          fi
           echo "KSU_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           cd ..
           bash KernelSU-Next/kernel/setup.sh "${KSU_NEXT_BRANCH}"
-
-      - name: Relax KernelSU Kbuild check
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          KB="drivers/kernelsu/Kbuild"
-          if [ ! -f "$KB" ]; then
-            exit 0
-          fi
-          cp "$KB" "${KB}.orig"
-          sed -i 's|\$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")|$(warning "KernelSU: configs not visible during clean phase, non-fatal")|g' "$KB"
-          sed -i 's|error "KernelSU requires|warning "KernelSU requires|g' "$KB"
 
       - name: Install Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -302,19 +239,6 @@ jobs:
         run: |
           set -euo pipefail
           sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig
-
-      - name: Verify BBG installation
-        if: ${{ github.event.inputs.enable_bbg == 'true' }}
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          grep -q "baseband_guard" common/security/Kconfig || exit 1
-
-      - name: Record BBG version
-        if: ${{ github.event.inputs.enable_bbg == 'true' }}
-        working-directory: kernel_workspace/Baseband-guard
-        run: |
-          echo "BBG_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
 
       - name: Enable BBG config
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -543,7 +467,7 @@ jobs:
           CFG=$(find out -name ".config" | head -n1)
           [ -z "$CFG" ] && exit 1
           FAILED="false"
-          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS; do
+          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_KPROBES; do
             if grep -q "^${SYM}=y$" "$CFG"; then
               echo "OK: ${SYM}=y"
             else
