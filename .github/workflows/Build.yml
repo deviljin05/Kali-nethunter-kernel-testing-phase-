@@ -44,7 +44,7 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
           sudo apt-get clean
 
-      - name: Install dependencies
+      - name: Install dependencies (includes binutils for ld)
         run: |
           sudo apt-get update
           sudo apt-get install -y git curl bc bison flex libssl-dev \
@@ -161,7 +161,7 @@ jobs:
           set -euo pipefail
           sed -i '1i #define SUSFS_MAX_LEN_PATHNAME 256\n#define SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE 8192\n#define SUSFS_ENABLED_FEATURES_SIZE 8192' include/linux/susfs.h
 
-      - name: Ensure susfs.h included everywhere
+      - name: Ensure susfs.h included everywhere (guaranteed for fs/statfs.c)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
@@ -181,9 +181,10 @@ jobs:
               fi
             fi
           done
-          if [ -f fs/statfs.c ] && grep -q 'susfs_sus_kstat_spoof_vfs_statfs' fs/statfs.c; then
+          if [ -f fs/statfs.c ]; then
             if ! grep -q '#include <linux/susfs.h>' fs/statfs.c; then
               sed -i "1i #include <linux/susfs.h>" fs/statfs.c
+              echo "Added susfs.h to fs/statfs.c (guaranteed)"
             fi
           fi
 
@@ -220,7 +221,7 @@ jobs:
           echo "KSU_COMMIT=$(git -C KernelSU-Next rev-parse HEAD)" >> "$GITHUB_ENV"
           bash KernelSU-Next/kernel/setup.sh "${KSU_NEXT_BRANCH}"
 
-      - name: Fix KernelSU Kbuild — move error out of clean phase
+      - name: Guard KernelSU Kbuild error for clean phase only
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
@@ -228,21 +229,16 @@ jobs:
           if [ ! -f "$KB" ]; then
             exit 0
           fi
-          # Guard the $(error) so it only fires when KPROBES or SUSFS is actually off during build
           python3 - <<'PYEOF'
           import re
           p = "drivers/kernelsu/Kbuild"
           src = open(p).read()
-          # Only trigger the error if we are NOT in the clean phase
-          # We replace the unconditional $(error ...) with a guarded one that
-          # checks MAKECMDGOALS for clean/mrproper and skips then.
           src = src.replace(
               '$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")',
               '$(if $(filter clean mrproper,$(MAKECMDGOALS)),,$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y"))'
           )
           open(p, "w").write(src)
           PYEOF
-          echo "Patched KernelSU Kbuild — error now guarded for clean phase only"
 
       - name: Install Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
