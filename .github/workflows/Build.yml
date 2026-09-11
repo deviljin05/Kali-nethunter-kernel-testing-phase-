@@ -31,11 +31,14 @@ on:
 env:
   VERSION: android12-5.10
   CCACHE_DIR: /home/runner/.ccache
+  # KernelSU-Next commit from WildKernels Release r16 (latest verified)
+  KSU_NEXT_COMMIT: "3438d6aa431f96a23f9e625bec3d53ce1fb14161"
+  SUSFS_BRANCH: "gki-android12-5.10"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 150
+    timeout-minutes: 180
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -110,17 +113,69 @@ jobs:
           echo "Detected SUBLEVEL: $SUBLEVEL"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
-      - name: Clone SUSFS4KSU (latest = current SUSFS release)
+      # ================================================================
+      #  SUSFS CLONE — AUTO LATEST (as requested)
+      #  No commit pin. Uses whatever is HEAD on gki-android12-5.10
+      # ================================================================
+      - name: Clone SUSFS4KSU (auto latest on gki-android12-5.10 branch)
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android12-5.10 susfs4ksu
+          git clone --depth 1 -b "${SUSFS_BRANCH}" https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
           cd susfs4ksu
           if [ -n "${{ github.event.inputs.susfs_commit }}" ]; then
+            git fetch --depth 1 origin "${{ github.event.inputs.susfs_commit }}"
             git checkout "${{ github.event.inputs.susfs_commit }}"
           fi
           echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "SUSFS commit in use: $(git rev-parse HEAD) — $(git log -1 --format=%s)"
+
+      # ================================================================
+      #  SAFETY VERIFICATION — catches broken auto-latest before build
+      # ================================================================
+      - name: Verify SUSFS header contains all required constants
+        working-directory: kernel_workspace/susfs4ksu
+        run: |
+          set -euo pipefail
+          echo "=== Verifying SUSFS kernel_patches headers ==="
+          FAILED="false"
+
+          # Check susfs.h for critical constants
+          for CONST in SUSFS_MAX_LEN_PATHNAME SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE SUSFS_ENABLED_FEATURES_SIZE; do
+            if grep -q "${CONST}" kernel_patches/include/linux/susfs.h 2>/dev/null; then
+              echo "✓ ${CONST} found in susfs.h"
+            else
+              echo "::error::${CONST} NOT found in susfs.h — SUSFS branch is incomplete!"
+              FAILED="true"
+            fi
+          done
+
+          # Check susfs_def.h exists and contains definitions
+          if [ -f kernel_patches/include/linux/susfs_def.h ]; then
+            echo "✓ susfs_def.h exists"
+            if grep -q 'define SUSFS_MAX_LEN_PATHNAME' kernel_patches/include/linux/susfs_def.h; then
+              echo "✓ SUSFS_MAX_LEN_PATHNAME is defined in susfs_def.h"
+            else
+              echo "::error::SUSFS_MAX_LEN_PATHNAME NOT defined in susfs_def.h"
+              FAILED="true"
+            fi
+          else
+            echo "::error::susfs_def.h NOT found"
+            FAILED="true"
+          fi
+
+          if [ "${FAILED}" = "true" ]; then
+            echo ""
+            echo "============================================================"
+            echo "SUSFS AUTO-LATEST IS BROKEN"
+            echo "============================================================"
+            echo "The gki-android12-5.10 branch HEAD is incomplete."
+            echo "Please pin to a known-good commit:"
+            echo "  86114db0c49f20fa7857b8b559f3ab87cbc2d00d (WildKernels r5)"
+            echo "============================================================"
+            exit 1
+          fi
+          echo "=== SUSFS header verification PASSED ==="
 
       - name: Set SUSFS kernel configs
         run: |
@@ -169,24 +224,13 @@ jobs:
             exit 1
           fi
 
-      # ================================================================
-      #  FIX: Add #include <linux/susfs.h> to EVERY file that uses susfs_*
-      #  This now explicitly handles fs/statfs.c (and any other file).
-      # ================================================================
       - name: Ensure susfs.h is included wherever susfs_ symbols are used
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           echo "=== Scanning for susfs_* usages ==="
-          # Broader pattern: catches susfs_foo, susfs_foo_bar, susfs_foo123, etc.
           FILES_TO_FIX="$(grep -rlE '\bsusfs_[a-zA-Z0-9_]+\b' --include='*.c' --include='*.h' . | sort -u || true)"
-
-          if [ -z "${FILES_TO_FIX}" ]; then
-            echo "No files found calling susfs_* functions — nothing to do."
-          fi
-
           for f in $FILES_TO_FIX; do
-            # Skip the header itself and susfs source files (they already include it)
             case "$f" in
               */include/linux/susfs.h|*/fs/susfs.c|*/fs/susfs*)
                 echo "✓ Skipping $f (SUSFS source/header)"
@@ -201,38 +245,15 @@ jobs:
               else
                 sed -i "1i #include <linux/susfs.h>" "$f"
               fi
-            else
-              echo "✓ $f already includes linux/susfs.h"
             fi
           done
-
-          # ============================================================
-          #  SAFETY NET: Verify fs/statfs.c has the include (the exact
-          #  file that failed last time).
-          # ============================================================
-          echo "=== Verifying fs/statfs.c ==="
-          if [ -f fs/statfs.c ]; then
-            if grep -q 'susfs_sus_kstat_spoof_vfs_statfs' fs/statfs.c; then
-              if ! grep -q '#include <linux/susfs.h>' fs/statfs.c; then
-                echo "::warning::fs/statfs.c uses susfs_* but header is missing — adding manually"
-                LAST_INCLUDE_LINE="$(grep -n '^#include' fs/statfs.c | tail -1 | cut -d: -f1 || true)"
-                if [ -n "${LAST_INCLUDE_LINE}" ]; then
-                  sed -i "${LAST_INCLUDE_LINE}a #include <linux/susfs.h>" fs/statfs.c
-                else
-                  sed -i "1i #include <linux/susfs.h>" fs/statfs.c
-                fi
-              fi
-              echo "✓ fs/statfs.c now contains susfs.h include"
-            else
-              echo "ℹ fs/statfs.c does not reference susfs_sus_kstat_spoof_vfs_statfs (nothing to do)"
+          # Safety net: fs/statfs.c
+          if [ -f fs/statfs.c ] && grep -q 'susfs_sus_kstat_spoof_vfs_statfs' fs/statfs.c; then
+            if ! grep -q '#include <linux/susfs.h>' fs/statfs.c; then
+              sed -i "1i #include <linux/susfs.h>" fs/statfs.c
+              echo "✓ Added susfs.h to fs/statfs.c"
             fi
-          else
-            echo "::warning::fs/statfs.c not found"
           fi
-
-          echo "=== Final verification ==="
-          grep -n 'susfs_' fs/statfs.c | head -10 || true
-          grep -n '#include <linux/susfs.h>' fs/statfs.c || true
 
       - name: Fix SUSFS set_nameidata argument mismatch
         working-directory: kernel_workspace/common
@@ -260,19 +281,21 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      - name: Setup KernelSU-Next (Wild KSU, dev-susfs)
+      # ================================================================
+      #  KERNELSU-NEXT — PINNED COMMIT (verified from Release r16)
+      # ================================================================
+      - name: Setup KernelSU-Next (pinned commit from Release r16)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
+          git clone https://github.com/pershoot/KernelSU-Next.git -b dev-susfs KernelSU-Next
+          cd KernelSU-Next
+          git checkout "${KSU_NEXT_COMMIT}"
+          cd ..
+          echo "✓ KernelSU-Next checked out at ${KSU_NEXT_COMMIT}"
+          bash KernelSU-Next/kernel/setup.sh dev-susfs
 
-      - name: Fix KernelSU-Next (static.patch)
-        working-directory: kernel_workspace/common/KernelSU-Next
-        run: |
-          set -euo pipefail
-          curl -LSs -o static.patch \
-            https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/kernelsu/patches/static.patch
-          patch -p1 --forward < static.patch || echo "::warning::static.patch did not apply — may already be fixed upstream, not fatal"
+      # static.patch REMOVED — already fixed upstream in dev-susfs branch
 
       - name: Relax KernelSU Kbuild check for mrproper phase
         working-directory: kernel_workspace/common
@@ -286,12 +309,6 @@ jobs:
           cp "$KB" "${KB}.orig"
           sed -i 's|\$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")|$(warning "KernelSU: configs not visible during clean phase, non-fatal")|g' "$KB"
           sed -i 's|error "KernelSU requires|warning "KernelSU requires|g' "$KB"
-          if grep -q 'error "KernelSU requires' "$KB"; then
-            echo "::warning::Patch incomplete:"
-            grep -n 'KernelSU requires' "$KB" || true
-          else
-            echo "✓ Kbuild \$(error) -> \$(warning) applied"
-          fi
 
       - name: Install Baseband Guard (BBG)
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -315,7 +332,7 @@ jobs:
           if grep -q "baseband_guard" common/security/Kconfig; then
             echo "✓ BBG registered in common/security/Kconfig"
           else
-            echo "::error::baseband_guard not found in common/security/Kconfig after setup — BBG install likely failed above"
+            echo "::error::baseband_guard not found in common/security/Kconfig"
             exit 1
           fi
 
@@ -325,7 +342,6 @@ jobs:
         run: |
           BBG_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
           echo "BBG_COMMIT=${BBG_COMMIT}" >> "$GITHUB_ENV"
-          echo "BBG commit: ${BBG_COMMIT}"
 
       - name: Enable BBG config
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -349,11 +365,9 @@ jobs:
                 BBR_CONG_NAME="$DETECTED"
               fi
             else
-              echo "::warning::BBRv3 patch had rejects — check .rej files below"
+              echo "::warning::BBRv3 patch had rejects"
               find . -name "*.rej"
             fi
-          else
-            echo "::warning::BBRv3 patch not found at expected path"
           fi
           echo "BBR_CONG_NAME=${BBR_CONG_NAME}" >> "$GITHUB_ENV"
           echo "BBRV3_PATCH_APPLIED=${BBRV3_PATCH_APPLIED}" >> "$GITHUB_ENV"
@@ -391,16 +405,16 @@ jobs:
           if [ "${SUBLEVEL}" -le "208" ]; then
             curl -LSs -o /tmp/0003-lockdep-assert-none-held.patch \
               https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/ntsync/patches/0003-lockdep-assert-none-held.patch
-            patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || echo "::warning::lockdep fix did not apply — may already be present"
+            patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || echo "::warning::lockdep fix did not apply"
           fi
 
           curl -LSs -o /tmp/ntsync_compat_android12-5.10.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_compat_android12-5.10.patch
-          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || echo "::warning::ntsync compat patch had rejects — check .rej"
+          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || echo "::warning::ntsync compat patch had rejects"
 
           curl -LSs -o /tmp/ntsync_base.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_base.patch
-          patch -p1 < /tmp/ntsync_base.patch || echo "::warning::ntsync base patch had rejects — check .rej"
+          patch -p1 < /tmp/ntsync_base.patch || echo "::warning::ntsync base patch had rejects"
 
           echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
 
@@ -413,7 +427,7 @@ jobs:
           curl -LSs -o /tmp/droidspaces_sysvipc_kabi.patch \
             https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
           if ! patch -p1 < /tmp/droidspaces_sysvipc_kabi.patch; then
-            echo "::warning::Droidspaces SYSVIPC kABI patch had rejects — skipping CONFIG_SYSVIPC/CONFIG_IPC_NS/CONFIG_POSIX_MQUEUE to avoid a bootloop."
+            echo "::warning::Droidspaces SYSVIPC kABI patch had rejects"
             find . -name "*.rej"
             DROIDSPACES_KABI_OK="false"
           fi
@@ -421,7 +435,7 @@ jobs:
           curl -LSs -o /tmp/droidspaces_posix_mqueue_kabi.patch \
             https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
           if ! patch -p1 < /tmp/droidspaces_posix_mqueue_kabi.patch; then
-            echo "::warning::Droidspaces POSIX_MQUEUE kABI patch had rejects — skipping CONFIG_SYSVIPC/CONFIG_IPC_NS/CONFIG_POSIX_MQUEUE to avoid a bootloop."
+            echo "::warning::Droidspaces POSIX_MQUEUE kABI patch had rejects"
             find . -name "*.rej"
             DROIDSPACES_KABI_OK="false"
           fi
@@ -437,8 +451,6 @@ jobs:
               echo "CONFIG_POSIX_MQUEUE=y"
               echo "CONFIG_IPC_NS=y"
             } >> gki_defconfig
-          else
-            echo "::warning::Skipping CONFIG_SYSVIPC/CONFIG_POSIX_MQUEUE/CONFIG_IPC_NS — Droidspaces kABI patches did not apply cleanly this run."
           fi
           {
             echo "CONFIG_NAMESPACES=y"
@@ -570,23 +582,22 @@ jobs:
           set -euo pipefail
           CFG=$(find out -name ".config" | head -n1)
           if [ -z "$CFG" ]; then
-            echo "::error::Could not find a compiled .config under kernel_workspace/out to verify"
+            echo "::error::Could not find a compiled .config"
             exit 1
           fi
           FAILED="false"
           for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS; do
             if grep -q "^${SYM}=y$" "$CFG"; then
-              echo "✓ ${SYM}=y confirmed in final .config"
+              echo "✓ ${SYM}=y confirmed"
             else
-              echo "::error::${SYM} is NOT enabled in the final .config."
-              grep -n "${SYM}" "$CFG" || echo "(no ${SYM} line found at all)"
+              echo "::error::${SYM} is NOT enabled"
               FAILED="true"
             fi
           done
           if grep -qE "^CONFIG_RTL8XXXU=(y|m)$" "$CFG"; then
-            echo "✓ CONFIG_RTL8XXXU confirmed in final .config"
+            echo "✓ CONFIG_RTL8XXXU confirmed"
           else
-            echo "::warning::CONFIG_RTL8XXXU did not end up enabled in the final .config"
+            echo "::warning::CONFIG_RTL8XXXU not enabled"
           fi
           if [ "${FAILED}" = "true" ]; then
             exit 1
@@ -601,7 +612,7 @@ jobs:
             IMG=$(find out -name "Image" | head -n1)
           fi
           if [ -z "$IMG" ]; then
-            echo "::error::No kernel Image found anywhere under kernel_workspace/out — build failed above"
+            echo "::error::No kernel Image found"
             exit 1
           fi
           echo "IMG_PATH=kernel_workspace/${IMG}" >> "$GITHUB_ENV"
