@@ -123,7 +123,6 @@ jobs:
             echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
             echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
             echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
-            echo "CONFIG_KPROBES=y"
           } >> gki_defconfig
 
       - name: Copy SUSFS kernel patches
@@ -221,18 +220,29 @@ jobs:
           echo "KSU_COMMIT=$(git -C KernelSU-Next rev-parse HEAD)" >> "$GITHUB_ENV"
           bash KernelSU-Next/kernel/setup.sh "${KSU_NEXT_BRANCH}"
 
-      - name: Fix KernelSU Kbuild check (error → warning for clean phase)
+      - name: Fix KernelSU Kbuild — move error out of clean phase
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           KB="drivers/kernelsu/Kbuild"
           if [ ! -f "$KB" ]; then
-            echo "Kbuild not found — skipping"
             exit 0
           fi
-          sed -i 's|\$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")|$(warning "KernelSU: configs not visible during clean phase, non-fatal")|g' "$KB"
-          sed -i 's|error "KernelSU requires|warning "KernelSU requires|g' "$KB"
-          echo "Patched KernelSU Kbuild — error → warning"
+          # Guard the $(error) so it only fires when KPROBES or SUSFS is actually off during build
+          python3 - <<'PYEOF'
+          import re
+          p = "drivers/kernelsu/Kbuild"
+          src = open(p).read()
+          # Only trigger the error if we are NOT in the clean phase
+          # We replace the unconditional $(error ...) with a guarded one that
+          # checks MAKECMDGOALS for clean/mrproper and skips then.
+          src = src.replace(
+              '$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")',
+              '$(if $(filter clean mrproper,$(MAKECMDGOALS)),,$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y"))'
+          )
+          open(p, "w").write(src)
+          PYEOF
+          echo "Patched KernelSU Kbuild — error now guarded for clean phase only"
 
       - name: Install Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -287,7 +297,6 @@ jobs:
           {
             echo "CONFIG_TCP_CONG_ADVANCED=y"
             echo "CONFIG_TCP_CONG_BBR=y"
-            echo "CONFIG_TCP_CONG_CUBIC=y"
             echo "CONFIG_TCP_CONG_BIC=y"
             echo "CONFIG_TCP_CONG_WESTWOOD=y"
             echo "CONFIG_TCP_CONG_HTCP=y"
@@ -295,8 +304,6 @@ jobs:
               echo "CONFIG_TCP_CONG_BBR3=y"
             fi
             echo "CONFIG_DEFAULT_TCP_CONG=\"${BBR_CONG_NAME}\""
-            echo "CONFIG_NET_SCH_FQ=y"
-            echo "CONFIG_NET_SCH_FQ_CODEL=y"
             echo "CONFIG_NET_SCH_CAKE=y"
           } >> gki_defconfig
 
@@ -345,10 +352,7 @@ jobs:
             echo "CONFIG_IPC_NS=y" >> gki_defconfig
           fi
           {
-            echo "CONFIG_NAMESPACES=y"
             echo "CONFIG_NET_NS=y"
-            echo "CONFIG_CGROUPS=y"
-            echo "CONFIG_PID_NS=y"
             echo "CONFIG_USER_NS=y"
             echo "CONFIG_DEVTMPFS=y"
             echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
@@ -368,28 +372,13 @@ jobs:
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
-            echo "CONFIG_USB_GADGET=y"
             echo "CONFIG_USB_LIBCOMPOSITE=y"
-            echo "CONFIG_USB_CONFIGFS=y"
-            echo "CONFIG_USB_CONFIGFS_SERIAL=y"
-            echo "CONFIG_USB_CONFIGFS_ACM=y"
             echo "CONFIG_USB_CONFIGFS_OBEX=y"
-            echo "CONFIG_USB_CONFIGFS_NCM=y"
-            echo "CONFIG_USB_CONFIGFS_ECM=y"
             echo "CONFIG_USB_CONFIGFS_ECM_SUBSET=y"
-            echo "CONFIG_USB_CONFIGFS_RNDIS=y"
-            echo "CONFIG_USB_CONFIGFS_EEM=y"
-            echo "CONFIG_USB_CONFIGFS_MASS_STORAGE=y"
-            echo "CONFIG_USB_CONFIGFS_F_HID=y"
-            echo "CONFIG_USB_CONFIGFS_F_FS=y"
-            echo "CONFIG_USB_CONFIGFS_UEVENT=y"
             echo "CONFIG_USB_CONFIGFS_F_LB_SS=y"
             echo "CONFIG_USB_CONFIGFS_F_PRINTER=y"
             echo "CONFIG_USB_CONFIGFS_F_UAC1=y"
             echo "CONFIG_USB_CONFIGFS_F_UAC1_LEGACY=y"
-            echo "CONFIG_USB_ACM=y"
-            echo "CONFIG_HIDRAW=y"
-            echo "CONFIG_UHID=y"
           } >> gki_defconfig
 
       - name: Set CAN bus configs
@@ -397,7 +386,6 @@ jobs:
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
-            echo "CONFIG_CAN=y"
             echo "CONFIG_CAN_RAW=y"
             echo "CONFIG_CAN_BCM=y"
             echo "CONFIG_CAN_GW=y"
@@ -422,9 +410,7 @@ jobs:
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
-            echo "CONFIG_IIO=y"
             echo "CONFIG_IIO_CONFIGFS=y"
-            echo "CONFIG_PCI_ENDPOINT=y"
             echo "CONFIG_PCI_ENDPOINT_CONFIGFS=y"
           } >> gki_defconfig
 
@@ -436,7 +422,6 @@ jobs:
             echo "CONFIG_WLAN=y"
             echo "CONFIG_CFG80211=y"
             echo "CONFIG_MAC80211=y"
-            echo "CONFIG_WLAN_VENDOR_REALTEK=y"
             echo "CONFIG_RTL8XXXU=y"
           } >> gki_defconfig
 
