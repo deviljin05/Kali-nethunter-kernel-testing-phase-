@@ -494,24 +494,6 @@ jobs:
           } >> gki_defconfig
 
       # ---------------------------------------------------------------
-      # BTF / eBPF. BPF itself is standard mainline Kconfig on every
-      # android12-5.10 sublevel, so these lines are always safe.
-      # ---------------------------------------------------------------
-      - name: Set BTF / eBPF configs
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "CONFIG_BPF=y"
-            echo "CONFIG_BPF_SYSCALL=y"
-            echo "CONFIG_BPF_JIT=y"
-            echo "CONFIG_BPF_JIT_ALWAYS_ON=y"
-            echo "CONFIG_DEBUG_INFO_BTF=y"
-            echo "CONFIG_DEBUG_INFO_BTF_MODULES=y"
-            echo "CONFIG_CGROUP_BPF=y"
-            echo "CONFIG_NETFILTER_XT_MATCH_BPF=y"
-          } >> gki_defconfig
-
-      # ---------------------------------------------------------------
       # Full USB gadget stack (MTP/PTP/RNDIS/ADB/mass-storage/configfs) —
       # requested explicitly, on top of whatever gki_defconfig ships by
       # default.
@@ -563,34 +545,6 @@ jobs:
             echo "CONFIG_WLAN_VENDOR_REALTEK=y"
             echo "CONFIG_RTL8XXXU=y"
           } >> gki_defconfig
-
-      # ---------------------------------------------------------------
-      # Ptrace Leak Fix + Unicode Fix — root-hiding patches from
-      # WildKernels/kernel_patches, applied fail-soft (warn on reject,
-      # don't hard-fail the build) since context drift is possible.
-      # ---------------------------------------------------------------
-      - name: Apply Ptrace Leak Fix patch
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          curl -LSs -o /tmp/gki_ptrace.patch \
-            https://raw.githubusercontent.com/WildKernels/kernel_patches/main/gki_ptrace.patch
-          patch -p1 < /tmp/gki_ptrace.patch || {
-            echo "::warning::Ptrace Leak Fix patch had rejects"
-            find . -name "*.rej"
-          }
-
-      - name: Apply Unicode Fix patch
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          # android12-5.10 predates the 6.1 branch, so use the "6.1-" variant
-          curl -LSs -o /tmp/unicode_bypass_fix.patch \
-            "https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/unicode_bypass_fix_6.1-.patch"
-          patch -p1 < /tmp/unicode_bypass_fix.patch || {
-            echo "::warning::Unicode Fix patch had rejects"
-            find . -name "*.rej"
-          }
 
       - name: Apply NTSync patches
         working-directory: kernel_workspace/common
@@ -689,14 +643,6 @@ jobs:
       # (kept, in case you ever need it) and gzip what's left, instead of
       # shipping the multi-hundred-MB raw binary.
       # ---------------------------------------------------------------
-      - name: Strip and compress vmlinux for artifact upload
-        working-directory: kernel_workspace/common/out
-        run: |
-          set -euo pipefail
-          llvm-strip --strip-debug -o vmlinux.stripped vmlinux
-          gzip -9 -c vmlinux.stripped > vmlinux.stripped.gz
-          echo "Original size:"; du -h vmlinux
-          echo "Stripped+gzipped size:"; du -h vmlinux.stripped.gz
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
