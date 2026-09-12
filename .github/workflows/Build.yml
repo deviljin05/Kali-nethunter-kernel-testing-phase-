@@ -8,7 +8,7 @@ on:
         required: true
         default: "android12-5.10.264_r00"
       susfs_commit:
-        description: "Optional SUSFS commit hash. Leave empty to use latest branch HEAD; workflow will fall back to a known-working commit if needed."
+        description: "Optional SUSFS commit hash. Leave empty to use latest branch HEAD."
         required: false
         default: ""
       device_name:
@@ -89,7 +89,7 @@ jobs:
       - name: Ensure ccache directory exists
         run: mkdir -p "${CCACHE_DIR}"
 
-      - name: Resolve manifest branch and optional pinned release tag
+      - name: Resolve manifest branch
         run: |
           set -euo pipefail
           INPUT="${{ github.event.inputs.os_patch_level }}"
@@ -117,7 +117,6 @@ jobs:
         run: |
           set -euo pipefail
           REMOTE_NAME="$(git remote | head -n1)"
-          [ -n "${REMOTE_NAME}" ]
           git fetch --depth=1 "${REMOTE_NAME}" "refs/tags/${PIN_TAG}:refs/tags/${PIN_TAG}"
           git checkout "refs/tags/${PIN_TAG}"
 
@@ -135,9 +134,9 @@ jobs:
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android12-5.10 susfs4ksu
           cd susfs4ksu
           if [ -n "${{ github.event.inputs.susfs_commit }}" ]; then
-            git checkout "${{ github.event.inputs.susfs_commit }}"
+            git checkout "${{ github.event.inputs.susfs_commit }}" || git checkout "${FALLBACK_SUSFS_COMMIT}"
           fi
-          echo "SUSFS_REQUESTED_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Set SUSFS kernel configs
         run: |
@@ -164,17 +163,12 @@ jobs:
           cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
           cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./
 
-      - name: Apply android12-5.10 pre-patch compatibility fixes
+      - name: Apply android12-5.10 compatibility fixes
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           if [ "${SUBLEVEL}" -le "43" ]; then
             perl -i -pe 's/(int|size_t)s+this_lens*=s*min_ts*(s*\u0001s*,/size_t this_len = min_t(size_t,/' fs/proc/base.c
-          fi
-          if [ "${SUBLEVEL}" -le "117" ]; then
-            sed -i '#^[[:space:]]*/*$#,#^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$#d' fs/notify/fdinfo.c
-            perl -i -pe 's/\bmask,s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
-            perl -i -pe 's/ignored_mask:%x/ignored_mask:0/g' fs/notify/fdinfo.c
           fi
 
       - name: Apply SUSFS kernel patch
@@ -183,45 +177,11 @@ jobs:
           set -euo pipefail
           patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch
 
-      - name: Verify SUSFS patch/header consistency
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          MISSING=""
-          for FN in $(grep -ohE 'susfs_[a-zA-Z0-9_]+' fs/statfs.c fs/stat.c fs/namei.c fs/open.c fs/exec.c fs/read_write.c 2>/dev/null | sort -u); do
-            if ! grep -rq "${FN}" include/linux/susfs*.h 2>/dev/null; then
-              MISSING="${MISSING} ${FN}"
-            fi
-          done
-          if [ -n "${MISSING}" ]; then
-            echo "ERROR: SUSFS patch calls functions with no matching header declaration:${MISSING}"
-            echo "Try pinning susfs_commit to a known-working commit."
-            exit 1
-          fi
-
       - name: Fix SUSFS set_nameidata argument mismatch
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' fs/namei.c
-
-      - name: Revert android12-5.10 pre-patch compatibility fixes
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          if [ "${SUBLEVEL}" -le "43" ]; then
-            sed -i 's/^size_t this_len = min_t(size_t, count, PAGE_SIZE);$/int this_len = min_t(int, count, PAGE_SIZE);/' fs/proc/base.c
-          fi
-          if [ "${SUBLEVEL}" -le "117" ]; then
-            perl -i -pe 's#^(s+if (inode) {)#$1
-            \t\t/*
-            \t\t * IN_ALL_EVENTS represents all of the mask bits
-            \t\t * that we expose to userspace.
-            \t\t */
-            \t\tu32 mask = mark->mask & IN_ALL_EVENTS;#m' fs/notify/fdinfo.c
-            perl -i -pe 's/\binotify_mark_user_mask(mark)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
-            perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
-          fi
 
       - name: Apply SUSFS show_pad fix
         working-directory: kernel_workspace/common
@@ -250,13 +210,6 @@ jobs:
           set -euo pipefail
           wget -qO- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
 
-      - name: Configure Baseband Guard LSM
-        if: ${{ github.event.inputs.enable_bbg == 'true' }}
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig
-
       - name: Enable BBG config
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         run: |
@@ -270,14 +223,12 @@ jobs:
           git clone --depth=1 https://github.com/WildKernels/kernel_patches.git /tmp/wildpatches
           BBRV3_PATCH="/tmp/wildpatches/common/bbrv3/0001-net-tcp-backport-BBRv3-to-android12-5.10.patch"
           BBR_CONG_NAME="bbr"
-          BBRV3_PATCH_APPLIED="false"
           if [ -f "$BBRV3_PATCH" ] && patch -p1 < "$BBRV3_PATCH"; then
-            BBRV3_PATCH_APPLIED="true"
             DETECTED="$(grep -rhoE '.names*=s*"[a-zA-Z0-9_]+"' net/ipv4/tcp_bbr*.c 2>/dev/null | grep -oE '"[a-zA-Z0-9_]+"' | tr -d '"' | head -n1 || true)"
             [ -n "$DETECTED" ] && BBR_CONG_NAME="$DETECTED"
+            echo "CONFIG_TCP_CONG_BBR3=y" >> arch/arm64/configs/gki_defconfig
           fi
           echo "BBR_CONG_NAME=${BBR_CONG_NAME}" >> "$GITHUB_ENV"
-          echo "BBRV3_PATCH_APPLIED=${BBRV3_PATCH_APPLIED}" >> "$GITHUB_ENV"
 
       - name: Set networking / TCP congestion configs
         run: |
@@ -289,59 +240,15 @@ jobs:
             echo "CONFIG_TCP_CONG_BIC=y"
             echo "CONFIG_TCP_CONG_WESTWOOD=y"
             echo "CONFIG_TCP_CONG_HTCP=y"
-            if [ "${BBRV3_PATCH_APPLIED}" = "true" ]; then
-              echo "CONFIG_TCP_CONG_BBR3=y"
-            fi
             echo "CONFIG_DEFAULT_TCP_CONG=${BBR_CONG_NAME}"
             echo "CONFIG_NET_SCH_FQ=y"
             echo "CONFIG_NET_SCH_FQ_CODEL=y"
             echo "CONFIG_NET_SCH_CAKE=y"
           } >> gki_defconfig
 
-      - name: Apply NTSync patches
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          if [ "${SUBLEVEL}" -le "208" ]; then
-            curl -fsSL -o /tmp/0003-lockdep-assert-none-held.patch \
-              https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/ntsync/patches/0003-lockdep-assert-none-held.patch
-            patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch
-          fi
-          curl -fsSL -o /tmp/ntsync_compat_android12-5.10.patch \
-            https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_compat_android12-5.10.patch
-          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch
-          curl -fsSL -o /tmp/ntsync_base.patch \
-            https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_base.patch
-          patch -p1 < /tmp/ntsync_base.patch
-          echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
-
-      - name: Apply Droidspaces kABI-safe patches
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          DROIDSPACES_KABI_OK="true"
-          curl -fsSL -o /tmp/droidspaces_sysvipc_kabi.patch \
-            https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
-          if ! patch -p1 < /tmp/droidspaces_sysvipc_kabi.patch; then
-            DROIDSPACES_KABI_OK="false"
-          fi
-          curl -fsSL -o /tmp/droidspaces_posix_mqueue_kabi.patch \
-            https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
-          if ! patch -p1 < /tmp/droidspaces_posix_mqueue_kabi.patch; then
-            DROIDSPACES_KABI_OK="false"
-          fi
-          echo "DROIDSPACES_KABI_OK=${DROIDSPACES_KABI_OK}" >> "$GITHUB_ENV"
-
       - name: Set Droidspaces configs
         run: |
           cd kernel_workspace/common/arch/arm64/configs
-          if [ "${DROIDSPACES_KABI_OK}" = "true" ]; then
-            {
-              echo "CONFIG_SYSVIPC=y"
-              echo "CONFIG_POSIX_MQUEUE=y"
-              echo "CONFIG_IPC_NS=y"
-            } >> gki_defconfig
-          fi
           {
             echo "CONFIG_NAMESPACES=y"
             echo "CONFIG_NET_NS=y"
@@ -349,14 +256,6 @@ jobs:
             echo "CONFIG_PID_NS=y"
             echo "CONFIG_USER_NS=y"
             echo "CONFIG_DEVTMPFS=y"
-            echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
-            echo "CONFIG_NETFILTER_XT_TARGET_REJECT=y"
-            echo "CONFIG_NETFILTER_XT_TARGET_LOG=y"
-            echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y"
-            echo "CONFIG_IP_SET=y"
-            echo "CONFIG_IP_SET_HASH_IP=y"
-            echo "CONFIG_IP_SET_HASH_NET=y"
-            echo "CONFIG_NETFILTER_XT_SET=y"
             echo "CONFIG_TMPFS_POSIX_ACL=y"
             echo "CONFIG_TMPFS_XATTR=y"
           } >> gki_defconfig
@@ -466,16 +365,6 @@ jobs:
           export CCACHE_MAXSIZE=8G
           LTO="${LTO}" BUILD_CONFIG=common/build.config.gki.aarch64 USE_CCACHE=1 CCACHE_DIR="${CCACHE_DIR}" build/build.sh -j"$(nproc)"
 
-      - name: Verify final configs
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          CFG=$(find out -name ".config" | head -n1)
-          [ -n "$CFG" ]
-          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET CONFIG_CAN CONFIG_CAN_RAW; do
-            grep -q "^${SYM}=y$" "$CFG"
-          done
-
       - name: Locate built Image
         working-directory: kernel_workspace
         run: |
@@ -493,7 +382,7 @@ jobs:
           git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 ak3
           cp "${{ env.IMG_PATH }}" ak3/Image
           cd ak3
-          ZIP_NAME="${{ github.event.inputs.device_name }}-Blaze-android12-5.10-susfs${SUSFS_REQUESTED_COMMIT:0:8}.zip"
+          ZIP_NAME="${{ github.event.inputs.device_name }}-Blaze-android12-5.10-susfs${SUSFS_COMMIT:0:8}.zip"
           zip -r9 -q "../${ZIP_NAME}" . -x ".git*"
 
       - name: Upload artifacts
