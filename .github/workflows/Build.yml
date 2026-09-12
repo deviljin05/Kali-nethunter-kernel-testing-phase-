@@ -203,6 +203,36 @@ jobs:
           set -euo pipefail
           sed -i '/$(error "KernelSU requires/d' drivers/kernelsu/Kbuild || true
 
+      - name: Apply safe Droidspaces kABI patches
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          DROIDSPACES_OK="true"
+
+          curl -fsSL -o /tmp/droidspaces_sysvipc_kabi.patch \
+            https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
+          if ! patch -p1 < /tmp/droidspaces_sysvipc_kabi.patch; then
+            DROIDSPACES_OK="false"
+          fi
+
+          curl -fsSL -o /tmp/droidspaces_posix_mqueue_kabi.patch \
+            https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
+          if ! patch -p1 < /tmp/droidspaces_posix_mqueue_kabi.patch; then
+            DROIDSPACES_OK="false"
+          fi
+
+          echo "DROIDSPACES_OK=${DROIDSPACES_OK}" >> "$GITHUB_ENV"
+
+      - name: Enable Droidspaces configs
+        if: ${{ env.DROIDSPACES_OK == 'true' }}
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_SYSVIPC=y"
+            echo "CONFIG_POSIX_MQUEUE=y"
+            echo "CONFIG_IPC_NS=y"
+          } >> gki_defconfig
+
       - name: Install Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         working-directory: kernel_workspace
@@ -246,7 +276,7 @@ jobs:
             echo "CONFIG_NET_SCH_CAKE=y"
           } >> gki_defconfig
 
-      - name: Set Droidspaces configs
+      - name: Set basic sandbox configs
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
